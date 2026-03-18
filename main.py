@@ -1,10 +1,14 @@
 import asyncio
 from pulsechain_rotation_agent import PulsechainRotationAgent
 
+
 async def main():
+    print("BOT STARTING", flush=True)
     agent = PulsechainRotationAgent()
 
+    # startup test message
     await agent.send_discord("✅ Bot LIVE - scanning PulseChain...")
+    print("DISCORD TEST SENT", flush=True)
 
     while True:
         try:
@@ -19,12 +23,13 @@ async def main():
                         msg = agent.format_signal(symbol)
                         if msg:
                             await agent.send_discord(msg)
-                            agent.last_alert_at[symbol] = asyncio.get_event_loop().time()
 
             await asyncio.sleep(300)
 
         except Exception as e:
-            print("Error:", e)
+            print(f"Error: {e}", flush=True)
             await asyncio.sleep(60)
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
