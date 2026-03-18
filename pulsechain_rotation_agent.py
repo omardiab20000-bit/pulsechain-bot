@@ -1,8 +1,10 @@
 import os
+import time
 import httpx
 from collections import defaultdict, deque
 
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+
 
 class PulsechainRotationAgent:
     def __init__(self):
@@ -17,17 +19,24 @@ class PulsechainRotationAgent:
         self.webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
         self.history = defaultdict(lambda: deque(maxlen=20))
-        self.last_signal_time = {}
-        self.last_signal_type = {}
+        self.last_alert_time = {}
+
+    # ---------------- FETCH ----------------
 
     async def fetch_token_pairs(self, address):
         res = await self.client.get(DEX_URL.format(address))
-        return res.json().get("pairs", [])
+        data = res.json()
+        return data.get("pairs", [])
 
     def choose_primary_pair(self, pairs):
         if not pairs:
             return None
-        return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+        return max(
+            pairs,
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+        )
+
+    # ---------------- DATA ----------------
 
     def append_history(self, symbol, pair):
         self.history[symbol].append(pair)
@@ -60,11 +69,103 @@ class PulsechainRotationAgent:
         hist = list(self.history[symbol])
         if len(hist) < 2:
             return 0
+
         first = float((hist[0].get("liquidity") or {}).get("usd") or 0)
         last = float((hist[-1].get("liquidity") or {}).get("usd") or 0)
-        return ((last - first) / first) * 100 if first > 0 else 0
+
+        if first <= 0:
+            return 0
+
+        return ((last - first) / first) * 100
 
     def get_chart_link(self, pair):
-        return f"https://dexscreener.com/pulsechain/{pair.get('pairAddress')}"
+        pair_address = pair.get("pairAddress")
+        if pair_address:
+            return f"https://dexscreener.com/pulsechain/{pair_address}"
+        return "https://dexscreener.com"
 
-    def build_signal(self,
+    # ---------------- SNIPER LOGIC ----------------
+
+    def build_signal(self, symbol):
+        pair = self.get_pair(symbol)
+        if not pair:
+            return None
+
+        try:
+            liquidity = self.liquidity_usd(pair)
+            volume = self.volume_24h(pair)
+            vol_liq = self.volume_liq(pair)
+            pressure = self.pressure(pair)
+            price_1h = self.price_change_1h(pair)
+            liq_growth = self.liquidity_growth_pct(symbol)
+            chart = self.get_chart_link(pair)
+        except Exception as e:
+            print(f"[{symbol}] data error: {e}", flush=True)
+            return None
+
+        # 🚀 SNIPER (CONFIRMED BREAKOUT ONLY)
+        if (
+            vol_liq >= 1.3
+            and pressure >= 1.3
+            and price_1h >= 0.5
+            and liq_growth >= -1
+        ):
+            return {
+                "symbol": symbol,
+                "liquidity": liquidity,
+                "volume": volume,
+                "vol_liq": vol_liq,
+                "pressure": pressure,
+                "price_1h": price_1h,
+                "liq_growth": liq_growth,
+                "chart": chart,
+            }
+
+        return None
+
+    # ---------------- ALERT CONTROL ----------------
+
+    def should_send_signal(self, symbol):
+        now = time.time()
+        last = self.last_alert_time.get(symbol, 0)
+
+        if now - last < 1800:  # 30 min cooldown
+            return False
+
+        return True
+
+    def mark_signal_sent(self, symbol):
+        self.last_alert_time[symbol] = time.time()
+
+    # ---------------- FORMAT ----------------
+
+    def format_money(self, v):
+        if v >= 1_000_000:
+            return f"${v/1_000_000:.1f}M"
+        if v >= 1_000:
+            return f"${v/1_000:.1f}K"
+        return f"${v:.0f}"
+
+    def format_signal(self, symbol, s):
+        return (
+            f"🚀 **{symbol} SNIPER ENTRY**\n\n"
+            f"💧 Liq: {self.format_money(s['liquidity'])} ({s['liq_growth']:+.1f}%)\n"
+            f"📊 Vol/Liq: {s['vol_liq']:.2f}\n"
+            f"💰 Vol: {self.format_money(s['volume'])}\n"
+            f"⚖️ Pressure: {s['pressure']:.2f}\n"
+            f"📈 1H: {s['price_1h']:+.2f}%\n\n"
+            f"🔥 Breakout + volume expansion detected\n"
+            f"🎯 Action: Momentum confirmed — consider entry\n"
+            f"🔗 Chart: {s['chart']}"
+        )
+
+    # ---------------- DISCORD ----------------
+
+    async def send_discord(self, message):
+        if not self.webhook:
+            print("DISCORD_WEBHOOK_URL missing", flush=True)
+            return
+
+        res = await self.client.post(self.webhook, json={"content": message})
+        print("Discord status:", res.status_code, flush=True)
+        
