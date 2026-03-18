@@ -141,4 +141,188 @@ class PulsechainRotationAgent:
             return 0.0
 
         lookback = hist[-12] if len(hist) >= 12 else hist[0]
-        first = float((lookback.get("liquidity
+        first = float((lookback.get("liquidity") or {}).get("usd") or 0)
+        last = float((hist[-1].get("liquidity") or {}).get("usd") or 0)
+
+        if first <= 0:
+            return 0.0
+        return ((last - first) / first) * 100
+
+    def detect_absorption(self, pair, symbol):
+        vol_liq = self.volume_liq(pair)
+        pressure = self.pressure(pair)
+        price_1h = self.price_change_1h(pair)
+        liq_growth = self.liquidity_growth_pct(symbol)
+
+        return (
+            pressure < 1.0
+            and price_1h > -1.5
+            and vol_liq >= 0.8
+            and liq_growth >= -2.0
+        )
+
+    def compute_score(self, pair, symbol):
+        vol_liq = self.volume_liq(pair)
+        pressure = self.pressure(pair)
+        price_1h = self.price_change_1h(pair)
+        liq_growth = self.liquidity_growth_pct(symbol)
+
+        score = 0.0
+        score += min(vol_liq * 35, 50)
+        score += min(max(pressure - 1.0, 0) * 20, 25)
+        score += min(max(price_1h, 0) * 2.5, 15)
+        score += min(max(liq_growth, 0) * 0.6, 10)
+        return round(score, 1)
+
+    def build_signal(self, symbol):
+        pair = self.get_pair(symbol)
+        if not pair:
+            return None
+
+        liquidity = self.liquidity_usd(pair)
+        volume = self.volume_24h(pair)
+        vol_liq = self.volume_liq(pair)
+        pressure = self.pressure(pair)
+        price_1h = self.price_change_1h(pair)
+        liq_growth = self.liquidity_growth_pct(symbol)
+        stable_quoted = self.is_stable_quoted(pair)
+        absorption = self.detect_absorption(pair, symbol)
+        chart = self.get_chart_link(pair)
+        score = self.compute_score(pair, symbol)
+
+        if volume <= 0 or liquidity <= 0:
+            return None
+
+        if absorption:
+            tier = "ACCUMULATION"
+            emoji = "🧲"
+            title = "Absorption"
+            action = "🎯 Action: Watch closely / supply may be getting absorbed"
+            flow = "➡️ Flow: Selling is getting absorbed"
+            note = "✅ Price holding despite sell pressure"
+        elif vol_liq >= 1.5 and pressure >= 1.2 and price_1h > 0:
+            tier = "CONFIRMED"
+            emoji = "🔥"
+            title = "High Conviction"
+            action = "🎯 Action: Confirmed momentum / consider scaling in"
+            flow = f"➡️ Flow: OUT of stables → Into {symbol}" if stable_quoted else f"➡️ Flow: Strong risk-on into {symbol}"
+            note = "🟢 Breakout conditions look confirmed"
+        elif vol_liq >= 1.2 and pressure >= 1.2 and price_1h <= 0:
+            tier = "EARLY"
+            emoji = "🟡"
+            title = "Early Rotation"
+            action = "🎯 Action: Watch for 1H flip green before entry"
+            flow = f"➡️ Flow: Quiet accumulation / rotation building into {symbol}"
+            note = "👀 Buyers active, but price has not confirmed yet"
+        elif pressure < 0.9 and price_1h < 0:
+            tier = "DEFENSIVE"
+            emoji = "🔴"
+            title = "Defensive"
+            action = "🎯 Action: Stay patient / avoid chasing"
+            flow = "➡️ Flow: Defensive / sellers still in control"
+            note = "🔴 Weak pressure and price still soft"
+        else:
+            return None
+
+        return {
+            "symbol": symbol,
+            "tier": tier,
+            "emoji": emoji,
+            "title": title,
+            "action": action,
+            "flow": flow,
+            "note": note,
+            "liquidity": liquidity,
+            "volume": volume,
+            "vol_liq": vol_liq,
+            "pressure": pressure,
+            "price_1h": price_1h,
+            "liq_growth": liq_growth,
+            "score": score,
+            "chart": chart,
+        }
+
+    def should_send_signal(self, symbol, signal):
+        now = self._now()
+        last_time = self.last_signal_time.get(symbol, 0.0)
+        last_tier = self.last_signal_tier.get(symbol)
+
+        # Always allow new tier changes immediately
+        if last_tier and signal["tier"] != last_tier:
+            return True
+
+        # Otherwise enforce cooldown
+        if now - last_time < self.ALERT_COOLDOWN_SECONDS:
+            return False
+
+        return True
+
+    def mark_signal_sent(self, symbol, signal):
+        self.last_signal_time[symbol] = self._now()
+        self.last_signal_tier[symbol] = signal["tier"]
+
+    def summary_due(self):
+        return self._now() - self.last_summary_time >= self.SUMMARY_SECONDS
+
+    def mark_summary_sent(self):
+        self.last_summary_time = self._now()
+
+    def build_leaderboard_summary(self):
+        rows = []
+
+        for symbol in self.WATCH_TOKENS.keys():
+            pair = self.get_pair(symbol)
+            if not pair:
+                continue
+
+            signal = self.build_signal(symbol)
+            score = self.compute_score(pair, symbol)
+            flow = signal["flow"].replace("➡️ Flow: ", "") if signal else "No strong signal"
+            rows.append((symbol, score, flow))
+
+        if not rows:
+            return None
+
+        rows.sort(key=lambda x: x[1], reverse=True)
+        top = rows[:3]
+
+        lines = ["🏆 **4H Rotation Leaderboard**", ""]
+        for i, (symbol, score, flow) in enumerate(top, start=1):
+            lines.append(f"{i}️⃣ **{symbol}** — Score {score:.0f}")
+            lines.append(f"   {flow}")
+
+        return "\n".join(lines)
+
+    def format_signal(self, symbol, signal):
+        return (
+            f"{signal['emoji']} **{symbol} {signal['title']}**\n\n"
+            f"💧 Liq: {self.format_money(signal['liquidity'])} ({signal['liq_growth']:+.1f}%)\n"
+            f"📊 Vol/Liq: {signal['vol_liq']:.2f}\n"
+            f"💰 Vol: {self.format_money(signal['volume'])}\n"
+            f"⚖️ Pressure: {signal['pressure']:.2f}\n"
+            f"📈 1H Price: {signal['price_1h']:+.2f}%\n"
+            f"🧠 Score: {signal['score']:.0f}/100\n\n"
+            f"{signal['flow']}\n"
+            f"{signal['note']}\n\n"
+            f"{signal['action']}\n"
+            f"🔗 Chart: {signal['chart']}"
+        )
+
+    async def send_discord(self, message):
+        if not self.webhook:
+            print("DISCORD_WEBHOOK_URL missing", flush=True)
+            return
+
+        response = await self.client.post(
+            self.webhook,
+            json={"content": message}
+        )
+
+        print(f"Discord status: {response.status_code}", flush=True)
+        if response.status_code >= 400:
+            print(f"Discord response: {response.text}", flush=True)
+
+    def _now(self):
+        # monotonic-ish enough for cooldowns in one process
+        import time
+        return time.monotonic()
