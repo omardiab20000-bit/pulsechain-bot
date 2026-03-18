@@ -3,30 +3,47 @@ from pulsechain_rotation_agent import PulsechainRotationAgent
 
 
 async def main():
-    print("BOT STARTING", flush=True)
     agent = PulsechainRotationAgent()
 
+    print("BOT STARTING", flush=True)
     await agent.send_discord("✅ Bot LIVE - scanning PulseChain...")
-    print("DISCORD TEST SENT", flush=True)
 
     while True:
         try:
+            # Scan all watched tokens
             for symbol, address in agent.WATCH_TOKENS.items():
-                pairs = await agent.fetch_token_pairs(address)
-                primary = agent.choose_primary_pair(pairs)
+                try:
+                    pairs = await agent.fetch_token_pairs(address)
+                    primary = agent.choose_primary_pair(pairs)
+                    if primary:
+                        agent.append_history(symbol, primary)
+                except Exception as token_error:
+                    print(f"[{symbol}] scan error: {token_error}", flush=True)
 
-                if primary:
-                    agent.append_history(symbol, primary)
+            # Send signal alerts
+            for symbol in agent.WATCH_TOKENS.keys():
+                try:
+                    signal = agent.build_signal(symbol)
+                    if signal and agent.should_send_signal(symbol, signal):
+                        await agent.send_discord(agent.format_signal(symbol, signal))
+                        agent.mark_signal_sent(symbol, signal)
+                except Exception as signal_error:
+                    print(f"[{symbol}] signal error: {signal_error}", flush=True)
 
-                    if agent.should_alert(symbol):
-                        msg = agent.format_signal(symbol)
-                        if msg:
-                            await agent.send_discord(msg)
+            # Send 4H summary if due
+            try:
+                if agent.summary_due():
+                    summary = agent.build_leaderboard_summary()
+                    if summary:
+                        await agent.send_discord(summary)
+                        agent.mark_summary_sent()
+            except Exception as summary_error:
+                print(f"[SUMMARY] error: {summary_error}", flush=True)
 
-            await asyncio.sleep(300)
+            await asyncio.sleep(agent.FAST_SCAN_SECONDS)
 
-        except Exception as e:
-            print(f"Error: {e}", flush=True)
+        except Exception as loop_error:
+            print(f"[LOOP] fatal error: {loop_error}", flush=True)
             await asyncio.sleep(60)
 
 
