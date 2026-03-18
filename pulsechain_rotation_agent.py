@@ -1,9 +1,11 @@
-import httpx, os
+import os
+import httpx
 
-DEX = "https://api.dexscreener.com/latest/dex/tokens/{}"
+
+DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+
 
 class PulsechainRotationAgent:
-
     WATCH_TOKENS = {
         "PLS": "0xa1077a294dde1b09bb078844df40758a5d0f9a27",
         "PLSX": "0x95b303987a60c71504d99aa1b13b4da07b0790ab",
@@ -11,70 +13,74 @@ class PulsechainRotationAgent:
     }
 
     def __init__(self):
-        self.client = httpx.AsyncClient()
+        self.client = httpx.AsyncClient(timeout=30.0)
         self.history = {}
-        self.last_alert_at = {}
-        self.webhook = os.getenv("DISCORD_WEBHOOK_URL")
+        self.webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
     async def fetch_token_pairs(self, address):
-        r = await self.client.get(DEX.format(address))
-        return r.json().get("pairs", [])
+        r = await self.client.get(DEX_URL.format(address))
+        r.raise_for_status()
+        data = r.json()
+        return data.get("pairs", [])
 
     def choose_primary_pair(self, pairs):
         if not pairs:
             return None
-        return max(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0))
+
+        pulse_pairs = [p for p in pairs if p.get("chainId") == "pulsechain"]
+        if not pulse_pairs:
+            return None
+
+        return max(
+            pulse_pairs,
+            key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0),
+        )
 
     def append_history(self, symbol, pair):
         self.history[symbol] = pair
 
     def volume_liq(self, pair):
-        liq = pair.get("liquidity", {}).get("usd", 1)
-        vol = pair.get("volume", {}).get("h24", 0)
-        return vol / liq if liq else 0
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+        vol = float((pair.get("volume") or {}).get("h24") or 0)
+        if liq <= 0:
+            return 0.0
+        return vol / liq
 
     def pressure(self, pair):
-        buys = pair.get("txns", {}).get("h1", {}).get("buys", 1)
-        sells = pair.get("txns", {}).get("h1", {}).get("sells", 1)
-        return buys / sells if sells else buys
+        txns = pair.get("txns") or {}
+        h1 = txns.get("h1") or {}
+        buys = int(h1.get("buys") or 0)
+        sells = int(h1.get("sells") or 0)
+
+        if sells == 0:
+            return float(buys) if buys > 0 else 1.0
+        return buys / sells
 
     def should_alert(self, symbol):
-        if symbol not in self.history:
+        pair = self.history.get(symbol)
+        if not pair:
             return False
-        return self.volume_liq(self.history[symbol]) > 1
+
+        vliq = self.volume_liq(pair)
+        return vliq > 1.0
 
     def format_money(self, x):
-        if x > 1_000_000:
+        x = float(x or 0)
+        if x >= 1_000_000_000:
+            return f"${x/1_000_000_000:.1f}B"
+        if x >= 1_000_000:
             return f"${x/1_000_000:.1f}M"
-        if x > 1_000:
+        if x >= 1_000:
             return f"${x/1_000:.1f}K"
-        return f"${x}"
+        return f"${x:.0f}"
 
     def format_signal(self, symbol):
         p = self.history[symbol]
 
-        liq = p.get("liquidity", {}).get("usd", 0)
-        vol = p.get("volume", {}).get("h24", 0)
+        liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        vol = float((p.get("volume") or {}).get("h24") or 0)
         vliq = self.volume_liq(p)
         pres = self.pressure(p)
+        price_change = float((p.get("priceChange") or {}).get("h1") or 0)
 
-        if vliq > 1.5:
-            emoji = "🔥"
-            action = "Consider entry"
-        else:
-            emoji = "🟡"
-            action = "Watch"
-
-        return (
-            f"{emoji} {symbol} Signal\n"
-            f"💧 Liq: ${liq:,.0f}\n"
-            f"📊 Vol/Liq: {vliq:.2f}\n"
-            f"💰 Vol: {self.format_money(vol)}\n"
-            f"⚖️ Pressure: {pres:.2f}\n"
-            f"🎯 Action: {action}"
-        )
-
-    async def send_discord(self, msg):
-        if not self.webhook:
-            return
-        await self.client.post(self.webhook, json={"content": msg})
+        if
