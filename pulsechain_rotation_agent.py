@@ -1,7 +1,6 @@
 import os
 import httpx
 
-
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 
@@ -18,9 +17,9 @@ class PulsechainRotationAgent:
         self.webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
     async def fetch_token_pairs(self, address):
-        r = await self.client.get(DEX_URL.format(address))
-        r.raise_for_status()
-        data = r.json()
+        response = await self.client.get(DEX_URL.format(address))
+        response.raise_for_status()
+        data = response.json()
         return data.get("pairs", [])
 
     def choose_primary_pair(self, pairs):
@@ -33,22 +32,24 @@ class PulsechainRotationAgent:
 
         return max(
             pulse_pairs,
-            key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0),
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
         )
 
     def append_history(self, symbol, pair):
         self.history[symbol] = pair
 
     def volume_liq(self, pair):
-        liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-        vol = float((pair.get("volume") or {}).get("h24") or 0)
-        if liq <= 0:
+        liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+        volume = float((pair.get("volume") or {}).get("h24") or 0)
+
+        if liquidity <= 0:
             return 0.0
-        return vol / liq
+        return volume / liquidity
 
     def pressure(self, pair):
         txns = pair.get("txns") or {}
         h1 = txns.get("h1") or {}
+
         buys = int(h1.get("buys") or 0)
         sells = int(h1.get("sells") or 0)
 
@@ -61,26 +62,61 @@ class PulsechainRotationAgent:
         if not pair:
             return False
 
-        vliq = self.volume_liq(pair)
-        return vliq > 1.0
+        return self.volume_liq(pair) > 1.0
 
-    def format_money(self, x):
-        x = float(x or 0)
-        if x >= 1_000_000_000:
-            return f"${x/1_000_000_000:.1f}B"
-        if x >= 1_000_000:
-            return f"${x/1_000_000:.1f}M"
-        if x >= 1_000:
-            return f"${x/1_000:.1f}K"
-        return f"${x:.0f}"
+    def format_money(self, value):
+        value = float(value or 0)
+
+        if value >= 1_000_000_000:
+            return f"${value / 1_000_000_000:.1f}B"
+        if value >= 1_000_000:
+            return f"${value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"${value / 1_000:.1f}K"
+        return f"${value:.0f}"
 
     def format_signal(self, symbol):
-        p = self.history[symbol]
+        pair = self.history[symbol]
 
-        liq = float((p.get("liquidity") or {}).get("usd") or 0)
-        vol = float((p.get("volume") or {}).get("h24") or 0)
-        vliq = self.volume_liq(p)
-        pres = self.pressure(p)
-        price_change = float((p.get("priceChange") or {}).get("h1") or 0)
+        liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+        volume = float((pair.get("volume") or {}).get("h24") or 0)
+        vol_liq = self.volume_liq(pair)
+        pressure = self.pressure(pair)
+        price_change_1h = float((pair.get("priceChange") or {}).get("h1") or 0)
 
-        if
+        if vol_liq > 1.5 and pressure > 1.1:
+            emoji = "🔥"
+            title = "High Conviction"
+            action = "🎯 Action: Consider entry / scale in"
+        elif vol_liq > 1.0:
+            emoji = "🟡"
+            title = "Watch"
+            action = "🎯 Action: Wait for confirmation"
+        else:
+            emoji = "🔴"
+            title = "Weak"
+            action = "🎯 Action: Stay patient / watch list"
+
+        return (
+            f"{emoji} **{symbol} {title}**\n\n"
+            f"💧 Liq: {self.format_money(liquidity)}\n"
+            f"📊 Vol/Liq: {vol_liq:.2f}\n"
+            f"💰 Vol: {self.format_money(volume)}\n"
+            f"⚖️ Pressure: {pressure:.2f}\n"
+            f"📈 1H Price: {price_change_1h:+.2f}%\n\n"
+            f"{action}"
+        )
+
+    async def send_discord(self, message):
+        if not self.webhook:
+            print("DISCORD_WEBHOOK_URL missing", flush=True)
+            return
+
+        response = await self.client.post(
+            self.webhook,
+            json={"content": message},
+        )
+
+        print(f"Discord status: {response.status_code}", flush=True)
+        if response.status_code >= 400:
+            print(f"Discord response: {response.text}", flush=True)
