@@ -6,6 +6,9 @@ async def main():
 
     while True:
         try:
+            # ✅ TEST MESSAGE (confirms bot is working)
+            await agent.send_discord("✅ Bot LIVE - scanning PulseChain...")
+
             for symbol, address in agent.WATCH_TOKENS.items():
                 pairs = await agent.fetch_token_pairs(address)
                 primary = agent.choose_primary_pair(pairs)
