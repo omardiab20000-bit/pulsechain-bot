@@ -6,7 +6,6 @@ async def main():
     print("BOT STARTING", flush=True)
     agent = PulsechainRotationAgent()
 
-    # startup test message
     await agent.send_discord("✅ Bot LIVE - scanning PulseChain...")
     print("DISCORD TEST SENT", flush=True)
 
