@@ -1,5 +1,6 @@
 import os
 import time
+import statistics
 from datetime import datetime, timezone
 
 import httpx
@@ -11,6 +12,7 @@ DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G
 
 POLL_SECONDS = 600                    # 10 minutes
 MACRO_CACHE_SECONDS = 900             # 15 minutes
+
 TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 25
 ROTATION_ALERT_COOLDOWN_SECONDS = 60 * 45
 MACRO_ALERT_COOLDOWN_SECONDS = 60 * 60
@@ -21,10 +23,13 @@ COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
 
 DEBUG = True
 
+# ERC-20 Transfer(address,address,uint256)
+TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
 client = httpx.Client(
     timeout=20.0,
     follow_redirects=True,
-    headers={"User-Agent": "PulseChainRotationAgent/6.0"}
+    headers={"User-Agent": "PulseChainRotationAgent/7.0"}
 )
 
 # =========================================================
@@ -81,6 +86,7 @@ market_cache = {
 }
 
 latest_token_market = {}
+last_liquidity_by_symbol = {}
 
 # =========================================================
 # HELPERS
@@ -97,6 +103,8 @@ def safe_float(v, default=0.0):
 
 def safe_int(v, default=0):
     try:
+        if isinstance(v, str) and v.startswith("0x"):
+            return int(v, 16)
         return int(v or 0)
     except Exception:
         return default
@@ -136,6 +144,11 @@ def send_embed(title, description, color=PURPLE, url=None):
     except Exception as e:
         print("Webhook error:", e, flush=True)
 
+def parse_topic_address(topic_value):
+    if not topic_value or len(topic_value) < 42:
+        return ""
+    return "0x" + topic_value[-40:].lower()
+
 # =========================================================
 # MACRO
 # =========================================================
@@ -151,6 +164,7 @@ def refresh_macro():
                 "ids": "bitcoin,ethereum",
                 "price_change_percentage": "24h",
             },
+            timeout=10.0,
         )
         r.raise_for_status()
         data = r.json()
@@ -192,7 +206,7 @@ def refresh_macro():
 # =========================================================
 def fetch_token_dex(search_term):
     try:
-        r = client.get(DEX_SEARCH_URL, params={"q": search_term})
+        r = client.get(DEX_SEARCH_URL, params={"q": search_term}, timeout=10.0)
         r.raise_for_status()
         pairs = r.json().get("pairs", [])
 
@@ -209,7 +223,6 @@ def fetch_token_dex(search_term):
             tx_h1 = (p.get("txns") or {}).get("h1") or {}
             buys = safe_float(tx_h1.get("buys"))
             sells = safe_float(tx_h1.get("sells"))
-
             s = liq * 0.60 + vol_h24 * 0.30 + (buys + sells) * 50
             if liq < 25_000:
                 s *= 0.70
@@ -242,8 +255,12 @@ def fetch_token_dex(search_term):
 
         vol_liq_ratio = vol_h1 / max(liq_usd, 1.0)
 
+        pair_address = best.get("pairAddress") or ""
+        pair_url = best.get("url") or ""
+
         return {
-            "url": best.get("url") or "",
+            "pair_address": pair_address,
+            "url": pair_url,
             "liq_usd": liq_usd,
             "vol_h1": vol_h1,
             "vol_h6": vol_h6,
@@ -263,99 +280,210 @@ def fetch_token_dex(search_term):
         return None
 
 # =========================================================
-# PULSECHAIN SCAN LAYER
+# PULSESCAN GENERIC
 # =========================================================
-def pulsescan_txlist(contract_address, offset=80):
+def pulsescan_get(params, timeout=8.0):
     try:
-        r = client.get(
-            PULSESCAN_API,
-            params={
-                "module": "account",
-                "action": "txlist",
-                "address": contract_address,
-                "page": 1,
-                "offset": offset,
-                "sort": "desc",
-            },
-        )
+        r = client.get(PULSESCAN_API, params=params, timeout=timeout)
         r.raise_for_status()
         data = r.json()
         result = data.get("result", [])
-        if isinstance(result, list):
-            return result
-        return []
+        return result if isinstance(result, list) else result
     except Exception as e:
-        print(f"PulseScan txlist error ({contract_address}):", e, flush=True)
-        return []
+        print(f"PulseScan error ({params.get('action')}): {e}", flush=True)
+        return [] if params.get("action") in ("getLogs", "txlist") else None
 
-def analyze_scan_activity(contract_address):
-    txs = pulsescan_txlist(contract_address, offset=80)
+def get_latest_block():
+    result = pulsescan_get(
+        {
+            "module": "block",
+            "action": "eth_block_number",
+        },
+        timeout=6.0,
+    )
+    if isinstance(result, str):
+        return safe_int(result, 0)
+    return 0
 
+def get_logs(address, from_block, to_block, topic0=None):
+    params = {
+        "module": "logs",
+        "action": "getLogs",
+        "fromBlock": str(from_block),
+        "toBlock": str(to_block),
+        "address": address,
+    }
+    if topic0:
+        params["topic0"] = topic0
+    result = pulsescan_get(params, timeout=8.0)
+    return result if isinstance(result, list) else []
+
+def txlist_address(address, offset=60):
+    result = pulsescan_get(
+        {
+            "module": "account",
+            "action": "txlist",
+            "address": address,
+            "page": 1,
+            "offset": offset,
+            "sort": "desc",
+        },
+        timeout=8.0,
+    )
+    return result if isinstance(result, list) else []
+
+# =========================================================
+# FREE INFERENCE LAYERS
+# =========================================================
+def analyze_contract_activity(contract_address):
+    txs = txlist_address(contract_address, offset=60)
     if not txs:
         return {
             "recent_tx_count": 0,
             "unique_from_count": 0,
             "activity_score": 0.0,
-            "whale_hint": 0.0,
         }
 
     now_ts = int(time.time())
     recent_30m = 0
     recent_2h = 0
     unique_from = set()
-    unique_to = set()
 
     for tx in txs:
         ts = safe_int(tx.get("timeStamp"))
-        if ts <= 0:
-            continue
-
-        age = now_ts - ts
         from_addr = (tx.get("from") or "").lower()
-        to_addr = (tx.get("to") or "").lower()
 
         if from_addr:
             unique_from.add(from_addr)
-        if to_addr:
-            unique_to.add(to_addr)
 
-        if age <= 1800:
+        age = now_ts - ts
+        if 0 <= age <= 1800:
             recent_30m += 1
-        if age <= 7200:
+        if 0 <= age <= 7200:
             recent_2h += 1
 
     activity_score = 0.0
     activity_score += clamp(recent_30m / 8.0, 0, 4.0)
     activity_score += clamp(recent_2h / 18.0, 0, 3.0)
-    activity_score += clamp(len(unique_from) / 20.0, 0, 2.0)
-    activity_score += clamp(len(unique_to) / 20.0, 0, 1.5)
+    activity_score += clamp(len(unique_from) / 20.0, 0, 2.5)
     activity_score = clamp(activity_score, 0, 10)
-
-    whale_hint = 0.0
-    if recent_30m >= 10:
-        whale_hint += 2.0
-    if len(unique_from) >= 12:
-        whale_hint += 1.5
-    if recent_2h >= 25:
-        whale_hint += 1.5
-    whale_hint = clamp(whale_hint, 0, 5.0)
 
     return {
         "recent_tx_count": recent_30m,
         "unique_from_count": len(unique_from),
         "activity_score": activity_score,
-        "whale_hint": whale_hint,
+    }
+
+def analyze_transfer_logs(token_contract, latest_block, blocks_back=1200):
+    if latest_block <= 0:
+        return {
+            "transfer_count": 0,
+            "unique_wallets": 0,
+            "big_transfer_score": 0.0,
+        }
+
+    from_block = max(0, latest_block - blocks_back)
+    logs = get_logs(token_contract, from_block, latest_block, topic0=TRANSFER_TOPIC0)
+
+    if not logs:
+        return {
+            "transfer_count": 0,
+            "unique_wallets": 0,
+            "big_transfer_score": 0.0,
+        }
+
+    amounts = []
+    wallets = set()
+
+    for log_item in logs:
+        topics = log_item.get("topics") or []
+        data_hex = log_item.get("data") or "0x0"
+
+        if len(topics) >= 3:
+            from_addr = parse_topic_address(topics[1])
+            to_addr = parse_topic_address(topics[2])
+            if from_addr:
+                wallets.add(from_addr)
+            if to_addr:
+                wallets.add(to_addr)
+
+        amounts.append(safe_int(data_hex, 0))
+
+    amounts = [a for a in amounts if a > 0]
+    if not amounts:
+        return {
+            "transfer_count": len(logs),
+            "unique_wallets": len(wallets),
+            "big_transfer_score": 0.0,
+        }
+
+    amounts_sorted = sorted(amounts)
+    median_amt = statistics.median(amounts_sorted)
+    max_amt = amounts_sorted[-1]
+    p90_amt = amounts_sorted[max(0, int(len(amounts_sorted) * 0.9) - 1)]
+
+    big_transfer_score = 0.0
+    if median_amt > 0:
+        if max_amt >= median_amt * 25:
+            big_transfer_score += 3.0
+        elif max_amt >= median_amt * 10:
+            big_transfer_score += 1.8
+
+        if p90_amt >= median_amt * 6:
+            big_transfer_score += 1.4
+
+    if len(logs) >= 30:
+        big_transfer_score += 0.8
+    if len(wallets) >= 20:
+        big_transfer_score += 1.0
+
+    big_transfer_score = clamp(big_transfer_score, 0, 6.0)
+
+    return {
+        "transfer_count": len(logs),
+        "unique_wallets": len(wallets),
+        "big_transfer_score": big_transfer_score,
+    }
+
+def analyze_liquidity_shift(symbol, current_liq):
+    prev_liq = last_liquidity_by_symbol.get(symbol)
+
+    if prev_liq is None or prev_liq <= 0:
+        last_liquidity_by_symbol[symbol] = current_liq
+        return {
+            "liq_delta_pct": 0.0,
+            "lp_add_hint": 0.0,
+            "lp_remove_hint": 0.0,
+        }
+
+    delta_pct = ((current_liq - prev_liq) / prev_liq) * 100.0
+    last_liquidity_by_symbol[symbol] = current_liq
+
+    lp_add_hint = 0.0
+    lp_remove_hint = 0.0
+
+    if delta_pct >= 6:
+        lp_add_hint = clamp(delta_pct / 4.0, 0, 4.0)
+    elif delta_pct <= -6:
+        lp_remove_hint = clamp(abs(delta_pct) / 4.0, 0, 4.0)
+
+    return {
+        "liq_delta_pct": delta_pct,
+        "lp_add_hint": lp_add_hint,
+        "lp_remove_hint": lp_remove_hint,
     }
 
 # =========================================================
-# MERGE MARKET LAYERS
+# SNAPSHOT BUILD
 # =========================================================
-def build_market_snapshot(token):
+def build_market_snapshot(token, latest_block):
     dex = fetch_token_dex(token["search"])
     if not dex:
         return None
 
-    scan = analyze_scan_activity(token["contract"])
+    contract_activity = analyze_contract_activity(token["contract"])
+    transfer_stats = analyze_transfer_logs(token["contract"], latest_block)
+    liq_stats = analyze_liquidity_shift(token["symbol"], dex["liq_usd"])
 
     whale_pressure = 0.0
     whale_pressure += clamp((dex["vol_h1"] / max(dex["liq_usd"] * 0.08, 1.0)), 0, 4.0)
@@ -364,17 +492,18 @@ def build_market_snapshot(token):
     elif dex["ratio_h1"] >= 1.15:
         whale_pressure += 1.0
     if dex["h1_change"] < 0 and dex["ratio_h1"] >= 1.15:
-        whale_pressure += 1.5
-    whale_pressure += scan["whale_hint"]
+        whale_pressure += 1.2
+    whale_pressure += transfer_stats["big_transfer_score"] * 0.7
     whale_pressure = clamp(whale_pressure, 0, 10)
 
     accumulation_score = 0.0
     accumulation_score += clamp(min(4.0, dex["ratio_h1"]) * 1.5, 0, 6.0)
     accumulation_score += 1.2 if dex["vol_liq_ratio"] >= 0.04 else 0.0
-    accumulation_score += 1.2 if dex["h1_change"] < 0 and dex["ratio_h1"] >= 1.1 else 0.0
+    accumulation_score += 1.0 if dex["h1_change"] < 0 and dex["ratio_h1"] >= 1.1 else 0.0
     accumulation_score += 0.8 if dex["h6_change"] > 0 else 0.0
     accumulation_score += 0.6 if dex["liq_usd"] >= 100_000 else 0.0
-    accumulation_score += clamp(scan["activity_score"] * 0.22, 0, 2.0)
+    accumulation_score += clamp(contract_activity["activity_score"] * 0.15, 0, 1.5)
+    accumulation_score += liq_stats["lp_add_hint"] * 0.5
     accumulation_score = clamp(accumulation_score, 0, 10)
 
     sell_pressure = 0.0
@@ -386,20 +515,23 @@ def build_market_snapshot(token):
         sell_pressure += 1.8
     if dex["vol_liq_ratio"] >= 0.04 and dex["ratio_h1"] < 1.0:
         sell_pressure += 1.2
-    if scan["activity_score"] >= 5.5 and dex["ratio_h1"] < 1.0:
+    if contract_activity["activity_score"] >= 5.5 and dex["ratio_h1"] < 1.0:
         sell_pressure += 1.0
+    sell_pressure += liq_stats["lp_remove_hint"] * 0.6
     sell_pressure = clamp(sell_pressure, 0, 10)
 
     merged = {}
     merged.update(dex)
-    merged.update(scan)
+    merged.update(contract_activity)
+    merged.update(transfer_stats)
+    merged.update(liq_stats)
     merged["whale_pressure"] = whale_pressure
     merged["accumulation_score"] = accumulation_score
     merged["sell_pressure"] = sell_pressure
     return merged
 
 # =========================================================
-# TOKEN SIGNAL ENGINE
+# TOKEN SIGNALS
 # =========================================================
 def derive_token_signal(symbol, m):
     ratio = m["ratio_h1"]
@@ -414,7 +546,7 @@ def derive_token_signal(symbol, m):
     mood = "neutral"
     action = "خليك كاش — انتظار"
 
-    if accumulation >= 6.5 and ratio >= 1.20:
+    if accumulation >= 5.8 and ratio >= 1.15:
         if h1 < 0:
             state = "accumulate"
             mood = "bullish"
@@ -424,7 +556,7 @@ def derive_token_signal(symbol, m):
             mood = "bullish"
             action = "عزّز بشكل تدريجي"
 
-    if whale >= 7.0 and ratio >= 1.25:
+    if whale >= 6.2 and ratio >= 1.18:
         state = "strong"
         mood = "bullish"
         action = "راقب — لا تطارد"
@@ -514,16 +646,15 @@ def should_send_token_alert(symbol, signal_key, state):
         return True
     return False
 
-def monitor_tokens():
+def monitor_tokens(latest_block):
     global latest_token_market
-
     latest_token_market = {}
 
     for token in TOKENS:
         symbol = token["symbol"]
         label = token["label"]
 
-        market = build_market_snapshot(token)
+        market = build_market_snapshot(token, latest_block)
         if not market:
             print(f"[TOKEN] {symbol} no market data", flush=True)
             continue
@@ -542,7 +673,9 @@ def monitor_tokens():
             f"{round(market['whale_pressure'], 1)}|"
             f"{round(market['accumulation_score'], 1)}|"
             f"{round(market['sell_pressure'], 1)}|"
-            f"{round(market['activity_score'], 1)}"
+            f"{round(market['activity_score'], 1)}|"
+            f"{round(market['liq_delta_pct'], 1)}|"
+            f"{round(market['big_transfer_score'], 1)}"
         )
 
         print(f"[TOKEN] {symbol} state={state} mood={mood} key={signal_key}", flush=True)
@@ -578,7 +711,7 @@ def monitor_tokens():
         last_token_signals[symbol] = signal_key
 
 # =========================================================
-# ROTATION ENGINE
+# ROTATION
 # =========================================================
 def detect_rotation():
     pls = latest_token_market.get("PLS")
@@ -591,21 +724,23 @@ def detect_rotation():
         pls["accumulation_score"] * 0.42 +
         pls["whale_pressure"] * 0.28 +
         clamp(pls["ratio_h1"], 0, 3) * 1.20 +
-        clamp(pls["activity_score"], 0, 10) * 0.22 +
-        (0.5 if pls["h1_change"] > 0 else 0.0)
+        clamp(pls["activity_score"], 0, 10) * 0.18 +
+        clamp(pls["big_transfer_score"], 0, 6) * 0.30 +
+        max(pls["liq_delta_pct"], 0) * 0.05
     )
 
     plsx_strength = (
         plsx["accumulation_score"] * 0.42 +
         plsx["whale_pressure"] * 0.28 +
         clamp(plsx["ratio_h1"], 0, 3) * 1.20 +
-        clamp(plsx["activity_score"], 0, 10) * 0.22 +
-        (0.5 if plsx["h1_change"] > 0 else 0.0)
+        clamp(plsx["activity_score"], 0, 10) * 0.18 +
+        clamp(plsx["big_transfer_score"], 0, 6) * 0.30 +
+        max(plsx["liq_delta_pct"], 0) * 0.05
     )
 
     diff = plsx_strength - pls_strength
 
-    if diff >= 2.2 and plsx["ratio_h1"] >= 1.15:
+    if diff >= 2.2 and plsx["ratio_h1"] >= 1.12:
         return {
             "state": "to_plsx",
             "title": "🟣 Rotation Alert",
@@ -613,7 +748,7 @@ def detect_rotation():
             "color": BLUE,
         }
 
-    if diff <= -2.2 and pls["ratio_h1"] >= 1.15:
+    if diff <= -2.2 and pls["ratio_h1"] >= 1.12:
         return {
             "state": "to_pls",
             "title": "🟢 Rotation Alert",
@@ -647,7 +782,6 @@ def monitor_macro():
     global last_macro_signal, last_macro_alert_time
 
     bias = market_cache.get("bias", "neutral")
-
     if bias == "neutral":
         return
 
@@ -679,7 +813,8 @@ def run_bot():
     while True:
         try:
             refresh_macro()
-            monitor_tokens()
+            latest_block = get_latest_block()
+            monitor_tokens(latest_block)
             monitor_rotation()
             monitor_macro()
             print("Loop completed successfully", flush=True)
