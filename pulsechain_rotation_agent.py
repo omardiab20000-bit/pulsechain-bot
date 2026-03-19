@@ -16,6 +16,12 @@ class PulsechainRotationAgent:
             "PROVEX": "0xf6f8db0aba00007681f8faf16a0fda1c9b030b11",
         }
 
+        self.SYMBOL_AR = {
+            "PLS": "عملة بولس",
+            "PLSX": "عملة بولس إكس",
+            "PROVEX": "عملة بروفكس",
+        }
+
         self.webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
         self.FAST_SCAN_SECONDS = int(os.getenv("FAST_SCAN_SECONDS", "300"))
@@ -104,7 +110,7 @@ class PulsechainRotationAgent:
     def is_stable_quoted(self, pair):
         return self.quote_symbol(pair) in self.STABLE_SYMBOLS
 
-    # ---------------- FORMAT ----------------
+    # ---------------- FORMAT / VISUALS ----------------
 
     def format_money(self, v):
         v = float(v or 0)
@@ -116,7 +122,145 @@ class PulsechainRotationAgent:
             return f"${v/1_000:.2f}K"
         return f"${v:.2f}"
 
+    def rank_badge(self, rank):
+        badges = {1: "🥇", 2: "🥈", 3: "🥉"}
+        return badges.get(rank, "📍")
+
+    def symbol_emoji(self, symbol):
+        mapping = {
+            "PLS": "🔴",
+            "PLSX": "🟣",
+            "PROVEX": "🔵",
+        }
+        return mapping.get(symbol, "🪙")
+
+    def pressure_emoji(self, pressure):
+        if pressure >= 2:
+            return "🔥"
+        if pressure >= 1.2:
+            return "🟢"
+        if pressure >= 0.9:
+            return "🟡"
+        return "🔻"
+
+    def volliq_emoji(self, vol_liq):
+        if vol_liq >= 1.5:
+            return "🚀"
+        if vol_liq >= 0.8:
+            return "📈"
+        if vol_liq >= 0.3:
+            return "📊"
+        return "🧊"
+
+    def liq_emoji(self, liq_growth):
+        if liq_growth >= 5:
+            return "🌊"
+        if liq_growth >= 1:
+            return "💧"
+        if liq_growth > -1:
+            return "🪙"
+        return "🥀"
+
+    def flow_score_emoji(self, score):
+        if score >= 8:
+            return "🔥"
+        if score >= 6:
+            return "🟢"
+        if score >= 4:
+            return "🟡"
+        return "🔻"
+
+    def flow_score_label_ar(self, score):
+        if score >= 8:
+            return "قوي جداً"
+        if score >= 6:
+            return "قوي"
+        if score >= 4:
+            return "متوسط"
+        return "ضعيف"
+
+    def symbol_name_ar(self, symbol):
+        return self.SYMBOL_AR.get(symbol, f"عملة {symbol}")
+
+    def signal_title_clean(self, signal):
+        return f"{signal['symbol']} Coin"
+
+    def one_liner_market_read_ar(self, row):
+        symbol = row["symbol"]
+        pressure = row["pressure"]
+        vol_liq = row["vol_liq"]
+        price_1h = row["price_1h"]
+        liq_growth = row["liq_growth"]
+
+        if pressure >= 2 and vol_liq >= 1:
+            return f"شراء واضح على {symbol} والزخم صاحي."
+        if pressure >= 1.2 and liq_growth > 0:
+            return f"في تجميع محترم على {symbol} والسيولة تتحسن."
+        if pressure < 1 and price_1h < 0:
+            return f"{symbol} عليه ضغط بيع والسوق حذر."
+        if vol_liq < 0.25:
+            return f"الحركة على {symbol} هادئة والسيولة بطيئة."
+        return f"{symbol} تحت المراقبة، لسه الإشارة مو محسومة."
+
     # ---------------- FLOW ENGINE ----------------
+
+    def flow_score(self, symbol):
+        pair = self.get_pair(symbol)
+        if not pair:
+            return 0
+
+        pressure = self.pressure(pair)
+        price_1h = self.price_change_1h(pair)
+        vol_liq = self.volume_liq(pair)
+        liq_growth = self.liquidity_growth_pct(symbol)
+
+        score = 0.0
+
+        if pressure >= 2.0:
+            score += 3.0
+        elif pressure >= 1.5:
+            score += 2.4
+        elif pressure >= 1.2:
+            score += 1.8
+        elif pressure >= 1.0:
+            score += 1.0
+        else:
+            score += 0.2
+
+        if vol_liq >= 1.5:
+            score += 3.0
+        elif vol_liq >= 1.0:
+            score += 2.4
+        elif vol_liq >= 0.7:
+            score += 1.8
+        elif vol_liq >= 0.3:
+            score += 1.0
+        else:
+            score += 0.2
+
+        if price_1h >= 6:
+            score += 2.0
+        elif price_1h >= 2:
+            score += 1.5
+        elif price_1h >= 0:
+            score += 1.0
+        elif price_1h > -2:
+            score += 0.5
+        else:
+            score += 0.1
+
+        if liq_growth >= 5:
+            score += 2.0
+        elif liq_growth >= 2:
+            score += 1.5
+        elif liq_growth >= 0:
+            score += 1.0
+        elif liq_growth > -2:
+            score += 0.5
+        else:
+            score += 0.1
+
+        return max(0, min(10, round(score)))
 
     def flow_read(self, symbol):
         pair = self.get_pair(symbol)
@@ -126,7 +270,6 @@ class PulsechainRotationAgent:
         pressure = self.pressure(pair)
         price_1h = self.price_change_1h(pair)
         vol_liq = self.volume_liq(pair)
-        liq_growth = self.liquidity_growth_pct(symbol)
 
         pls = self.get_pair("PLS")
         plsx = self.get_pair("PLSX")
@@ -179,6 +322,31 @@ class PulsechainRotationAgent:
 
         return "Flow mixed / not decisive yet"
 
+    def flow_read_ar(self, symbol):
+        flow = self.flow_read(symbol)
+
+        mapping = {
+            "Flow favors PLS over PLSX": "السيولة تميل بوضوح نحو PLS أكثر من PLSX",
+            "Flow still stronger in PLSX": "السيولة ما تزال أقوى في PLSX",
+            "Flow favors PLSX over PLS": "السيولة تميل بوضوح نحو PLSX أكثر من PLS",
+            "Flow still stronger in PLS": "السيولة ما تزال أقوى في PLS",
+            "Defensive flow / stable pair pressure increasing": "تدفق دفاعي — الضغط يتجه نحو أزواج الستيبِل",
+            "Risk-on flow building into PLS": "شهية المخاطرة ترتفع والسيولة تبدأ تدخل إلى PLS",
+            "Risk-on flow building into PLSX": "شهية المخاطرة ترتفع والسيولة تبدأ تدخل إلى PLSX",
+            "Risk-on flow building into PROVEX": "شهية المخاطرة ترتفع والسيولة تبدأ تدخل إلى PROVEX",
+            "Strong inflow into PLS": "في دخول قوي وواضح على PLS",
+            "Strong inflow into PLSX": "في دخول قوي وواضح على PLSX",
+            "Strong inflow into PROVEX": "في دخول قوي وواضح على PROVEX",
+            "Flow building into PLS": "السيولة تتجمع تدريجياً على PLS",
+            "Flow building into PLSX": "السيولة تتجمع تدريجياً على PLSX",
+            "Flow building into PROVEX": "السيولة تتجمع تدريجياً على PROVEX",
+            "Defensive tone / sellers active": "السوق دفاعي حالياً والبائعين نشطين",
+            "Flow mixed / not decisive yet": "التدفق مختلط ولسه الاتجاه غير محسوم",
+            "Flow unclear": "التدفق غير واضح حالياً",
+        }
+
+        return mapping.get(flow, "قراءة التدفق غير واضحة حالياً")
+
     # ---------------- ARABIC TRADER TALK ----------------
 
     def trader_talk_ar(self, signal):
@@ -186,28 +354,29 @@ class PulsechainRotationAgent:
         p = signal["pressure"]
         h = signal["price_1h"]
         lg = signal["liq_growth"]
+        fscore = signal.get("flow_score", 0)
 
         if t == "SNIPER":
             if signal["grade"] == "A+":
-                return "🔥 فرصة قوية — دخول تدريجي، الزخم واضح والسيولة داعمة"
+                return f"🔥 فرصة قوية — التدفق {fscore}/10 والزخم واضح والسيولة داعمة"
             if p >= 2:
-                return "💥 شراء واضح من السوق — ادخل بهدوء ولا تفوت بكامل الكمية"
-            return "✅ الاختراق تأكد — إذا بدك تدخل خليه دخول ذكي"
+                return f"💥 شراء واضح من السوق — التدفق {fscore}/10، ادخل بهدوء"
+            return f"✅ الاختراق تأكد — التدفق {fscore}/10"
 
         if t == "WATCH":
             if p >= 1.8 and h < 0:
-                return "👀 في تجميع محتمل — راقب الاختراق ولا تستعجل"
+                return f"👀 في تجميع محتمل — التدفق {fscore}/10، راقب التأكيد"
             if lg > 2:
-                return "💧 السيولة عم تدخل — فرصة قادمة إذا السعر أكد"
-            return "📊 راقبها عن قرب — لسه بدها تأكيد"
+                return f"💧 السيولة عم تدخل — التدفق {fscore}/10، فرصة قادمة إذا السعر أكد"
+            return f"📊 راقبها عن قرب — التدفق {fscore}/10 ولسه بدها تأكيد"
 
         if t == "EXTENDED":
-            return "⚠️ انتبه — خليك كاش لا تلاحق"
+            return f"⚠️ انتبه — الحركة ممدودة حتى لو التدفق {fscore}/10، لا تلاحق"
 
         if t == "BRAIN":
-            return signal.get("action_ar", "🧠 في حركة مهمّة بالسوق")
+            return signal.get("action_ar", f"🧠 في حركة مهمّة بالسوق — التدفق {fscore}/10")
 
-        return "📈 راقب السوق"
+        return f"📈 راقب السوق — التدفق {fscore}/10"
 
     # ---------------- SIGNAL ENGINE ----------------
 
@@ -225,6 +394,7 @@ class PulsechainRotationAgent:
             liq_growth = self.liquidity_growth_pct(symbol)
             chart = self.get_chart_link(pair)
             flow = self.flow_read(symbol)
+            flow_score = self.flow_score(symbol)
         except Exception as e:
             print(f"[{symbol}] data error: {e}", flush=True)
             return None
@@ -232,7 +402,6 @@ class PulsechainRotationAgent:
         if liquidity <= 0 or volume <= 0:
             return None
 
-        # Brain mode: core assets
         if symbol in ("PLS", "PLSX") and liq_growth >= 4 and pressure >= 1.1 and vol_liq >= 0.7:
             return {
                 "type": "BRAIN",
@@ -241,9 +410,11 @@ class PulsechainRotationAgent:
                 "title": "🧠 LIQUIDITY BUILDUP",
                 "grade": "Brain",
                 "note": "Liquidity is building on a core asset",
+                "note_ar": "السيولة عم تتجمع على أصل أساسي وقد تسبق حركة أكبر",
                 "flow": flow,
-                "action": "🎯 Action: Track closely / market may be preparing a bigger move",
-                "action_ar": "🧠 انتبه — السيولة عم تتجمع، ممكن حركة أكبر قادمة",
+                "flow_score": flow_score,
+                "action": "🎯 Track closely / market may be preparing a bigger move",
+                "action_ar": f"🧠 انتبه — السيولة عم تتجمع، التدفق {flow_score}/10، ممكن حركة أكبر قادمة",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -253,7 +424,6 @@ class PulsechainRotationAgent:
                 "liq_growth": liq_growth,
             }
 
-        # Extended
         if price_1h >= 12 or vol_liq >= 3.5:
             return {
                 "type": "EXTENDED",
@@ -262,8 +432,11 @@ class PulsechainRotationAgent:
                 "title": "⚠️ EXTENDED MOVE",
                 "grade": "Late",
                 "note": "Move looks stretched — avoid chasing",
+                "note_ar": "الحركة ممدودة أكثر من اللازم — الأفضل عدم الملاحقة",
                 "flow": flow,
-                "action": "🎯 Action: Wait for pullback / do not chase",
+                "flow_score": flow_score,
+                "action": "🎯 Wait for pullback / do not chase",
+                "action_ar": f"⚠️ خفف اندفاعك — التدفق {flow_score}/10 لكن الحركة ممدودة",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -273,7 +446,6 @@ class PulsechainRotationAgent:
                 "liq_growth": liq_growth,
             }
 
-        # Sniper
         if (
             vol_liq >= 1.3
             and pressure >= 1.3
@@ -288,8 +460,11 @@ class PulsechainRotationAgent:
                 "title": "🚀 SNIPER ENTRY",
                 "grade": grade,
                 "note": "Breakout + volume expansion detected",
+                "note_ar": "اختراق مع توسع بالحجم — الزخم حاضر",
                 "flow": flow,
-                "action": "🎯 Action: Momentum confirmed — consider entry",
+                "flow_score": flow_score,
+                "action": "🎯 Momentum confirmed — consider entry",
+                "action_ar": f"🚀 الزخم متأكد — التدفق {flow_score}/10، ادخل بحذر وذكاء",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -299,7 +474,6 @@ class PulsechainRotationAgent:
                 "liq_growth": liq_growth,
             }
 
-        # Watch
         if (
             vol_liq >= 0.9
             and pressure >= 1.15
@@ -310,11 +484,14 @@ class PulsechainRotationAgent:
                 "type": "WATCH",
                 "symbol": symbol,
                 "color": 0xF1C40F,
-                "title": "👀 WATCHLIST BUILDUP",
+                "title": "👀 WATCH",
                 "grade": "Watch",
                 "note": "Flow is building, but breakout not fully confirmed yet",
+                "note_ar": "التدفق يتحسن، لكن الاختراق لم يتأكد بالكامل بعد",
                 "flow": flow,
-                "action": "🎯 Action: Watch for confirmation / 1H strength",
+                "flow_score": flow_score,
+                "action": "🎯 Watch for confirmation / 1H strength",
+                "action_ar": f"👀 راقب التأكيد وقوة الساعة — التدفق {flow_score}/10",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -348,7 +525,14 @@ class PulsechainRotationAgent:
             pressure = self.pressure(pair)
             price_1h = self.price_change_1h(pair)
             liq_growth = self.liquidity_growth_pct(symbol)
-            score = (vol_liq * 30) + (max(pressure - 1, 0) * 20) + (max(price_1h, 0) * 3) + (max(liq_growth, 0) * 2)
+            flow_score = self.flow_score(symbol)
+
+            score = (
+                (vol_liq * 30)
+                + (max(pressure - 1, 0) * 20)
+                + (max(price_1h, 0) * 3)
+                + (max(liq_growth, 0) * 2)
+            )
 
             rows.append({
                 "symbol": symbol,
@@ -360,6 +544,8 @@ class PulsechainRotationAgent:
                 "price_1h": price_1h,
                 "liq_growth": liq_growth,
                 "flow": self.flow_read(symbol),
+                "flow_ar": self.flow_read_ar(symbol),
+                "flow_score": flow_score,
             })
 
         if not rows:
@@ -375,23 +561,43 @@ class PulsechainRotationAgent:
             "fields": [],
         }
 
+        separator = "━━━━━━━━━━━━━━━━━━━━━━"
+
         for i, row in enumerate(top, start=1):
+            rank = self.rank_badge(i)
+            symbol_icon = self.symbol_emoji(row["symbol"])
+            pressure_icon = self.pressure_emoji(row["pressure"])
+            vol_icon = self.volliq_emoji(row["vol_liq"])
+            liq_icon = self.liq_emoji(row["liq_growth"])
+            quick_read_ar = self.one_liner_market_read_ar(row)
+            flow_score = row["flow_score"]
+            flow_score_icon = self.flow_score_emoji(flow_score)
+            flow_score_label = self.flow_score_label_ar(flow_score)
+
             value = (
-                f"💧 Liq: {self.format_money(row['liq'])} ({row['liq_growth']:+.1f}%)\n"
-                f"📊 Vol/Liq: {row['vol_liq']:.2f}\n"
-                f"⚖️ Pressure: {row['pressure']:.2f}\n"
-                f"📈 1H: {row['price_1h']:+.2f}%\n"
-                f"➡️ {row['flow']}"
+                f"{liq_icon} **Liquidity / السيولة**: {self.format_money(row['liq'])} ({row['liq_growth']:+.1f}%)\n"
+                f"{vol_icon} **Vol/Liq / الحجم إلى السيولة**: {row['vol_liq']:.2f}\n"
+                f"{pressure_icon} **Pressure / القوة**: {row['pressure']:.2f}\n"
+                f"⏱️ **1H Move / حركة الساعة**: {row['price_1h']:+.2f}%\n"
+                f"{flow_score_icon} **Flow Score / تقييم التدفق**: {flow_score}/10 ({flow_score_label})\n"
+                f"🧭 **Flow / تدفق السيولة**: {row['flow']}\n"
+                f"🇸🇦 **التدفق**: {row['flow_ar']}\n"
+                f"📌 **الخلاصة**: {quick_read_ar}\n"
+                f"{separator}"
             )
+
             embed["fields"].append({
-                "name": f"{i}️⃣ {row['symbol']}",
+                "name": f"{rank} {symbol_icon} {row['symbol']} — {self.symbol_name_ar(row['symbol'])}",
                 "value": value,
                 "inline": False
             })
 
         embed["fields"].append({
-            "name": "🇸🇦 قراءة السوق",
-            "value": "إذا PLS أو PLSX عم يجمعوا سيولة، راقب السوق لأنه ممكن يكون في حركة أكبر. وإذا صار الميل دفاعي، خليك واعي على السيولة والـ stables.",
+            "name": "🧠 قراءة السوق",
+            "value": (
+                "إذا شفت تقييم التدفق عالي مع ضغط شراء وسيولة تتحسن، غالباً في حركة عم تنبني فعلياً. "
+                "أما إذا كان التقييم ضعيف أو متوسط، خليك مراقب أكثر من كونك مندفع."
+            ),
             "inline": False
         })
 
@@ -411,23 +617,29 @@ class PulsechainRotationAgent:
 
     def build_embed_payload(self, signal):
         action_ar = self.trader_talk_ar(signal)
+        fscore = signal.get("flow_score", 0)
+        fscore_icon = self.flow_score_emoji(fscore)
+        fscore_label = self.flow_score_label_ar(fscore)
+        symbol_ar = self.symbol_name_ar(signal["symbol"])
 
         embed = {
-            "title": f"{signal['symbol']} {signal['title']}",
+            "title": self.signal_title_clean(signal),
+            "description": f"{symbol_ar}",
             "color": signal["color"],
             "fields": [
-                {"name": "🏷️ Grade", "value": signal["grade"], "inline": True},
-                {"name": "💧 Liquidity", "value": self.format_money(signal["liquidity"]), "inline": True},
-                {"name": "📊 Vol/Liq", "value": f"{signal['vol_liq']:.2f}", "inline": True},
-                {"name": "💰 Volume", "value": self.format_money(signal["volume"]), "inline": True},
-                {"name": "⚖️ Pressure", "value": f"{signal['pressure']:.2f}", "inline": True},
-                {"name": "📈 1H", "value": f"{signal['price_1h']:+.2f}%", "inline": True},
-                {"name": "💧 Liquidity Δ", "value": f"{signal['liq_growth']:+.1f}%", "inline": True},
-                {"name": "➡️ Flow", "value": signal["flow"], "inline": False},
-                {"name": "🧠 Insight", "value": signal["note"], "inline": False},
-                {"name": "🎯 Action", "value": signal["action"], "inline": False},
-                {"name": "🇸🇦 قرار السوق", "value": action_ar, "inline": False},
-                {"name": "🔗 Chart", "value": signal["chart"], "inline": False},
+                {"name": "🪙 Coin / العملة", "value": f"{signal['symbol']} — {symbol_ar}", "inline": False},
+                {"name": "🏷️ Grade / التصنيف", "value": signal["grade"], "inline": True},
+                {"name": "💧 Liquidity / السيولة", "value": self.format_money(signal["liquidity"]), "inline": True},
+                {"name": "📊 Vol/Liq / الحجم إلى السيولة", "value": f"{signal['vol_liq']:.2f}", "inline": True},
+                {"name": "💰 Volume / الحجم", "value": self.format_money(signal["volume"]), "inline": True},
+                {"name": "⚖️ Pressure / القوة", "value": f"{signal['pressure']:.2f}", "inline": True},
+                {"name": "📈 1H / حركة الساعة", "value": f"{signal['price_1h']:+.2f}%", "inline": True},
+                {"name": "💧 Liquidity Δ / تغير السيولة", "value": f"{signal['liq_growth']:+.1f}%", "inline": True},
+                {"name": f"{fscore_icon} Flow Score / تقييم التدفق", "value": f"{fscore}/10 ({fscore_label})", "inline": True},
+                {"name": "🧭 Flow / تدفق السيولة", "value": f"{signal['flow']}\n{self.flow_read_ar(signal['symbol'])}", "inline": False},
+                {"name": "🧠 Insight / نظرة", "value": f"{signal['note']}\n{signal.get('note_ar', '')}\n\u200b\n\u200b", "inline": False},
+                {"name": "🎯 Action / الإجراء", "value": f"{signal['action']}\n{action_ar}", "inline": False},
+                {"name": "🔗 Chart / الشارت", "value": signal["chart"], "inline": False},
             ],
         }
 
