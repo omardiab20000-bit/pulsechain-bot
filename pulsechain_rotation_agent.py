@@ -1,9 +1,6 @@
-import re
+import os
 import time
-import html
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
-from xml.etree import ElementTree as ET
 
 import httpx
 
@@ -12,62 +9,46 @@ import httpx
 # =========================================================
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
 
+POLL_SECONDS = 600                    # 10 minutes
+MACRO_CACHE_SECONDS = 900             # 15 minutes
+TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 25
+ROTATION_ALERT_COOLDOWN_SECONDS = 60 * 45
+MACRO_ALERT_COOLDOWN_SECONDS = 60 * 60
+
+DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+PULSESCAN_API = "https://api.scan.pulsechain.com/api"
+COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
+
 DEBUG = True
-POLL_SECONDS = 300
-
-TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 20
-MACRO_ALERT_COOLDOWN_SECONDS = 60 * 25
-NEWS_ALERT_COOLDOWN_SECONDS = 60 * 60
-
-QUIET_HOURS_BETWEEN_SAME_NEWS = 6
-MIN_NEWS_SCORE = 5
-MIN_NEWS_PRICE_MOVE_FOR_ALERT = 1.25
-MACRO_CACHE_SECONDS = 600  # 10 minutes
 
 client = httpx.Client(
     timeout=20.0,
     follow_redirects=True,
-    headers={"User-Agent": "Mozilla/5.0 PulseChainRotationAgent/4.0"}
+    headers={"User-Agent": "PulseChainRotationAgent/6.0"}
 )
-
-# =========================================================
-# STATE
-# =========================================================
-last_richard_status = None
-last_richard_daily_date = None
-last_market_insight_date = None
-
-last_btc_eth_signals = {"bitcoin": None, "ethereum": None}
-last_macro_alert_time = {"bitcoin": 0, "ethereum": 0}
-
-last_token_signals = {"PLS": None, "PLSX": None, "PROVEX": None}
-last_token_alert_time = {"PLS": 0, "PLSX": 0, "PROVEX": 0}
-last_token_states = {"PLS": "neutral", "PLSX": "neutral", "PROVEX": "neutral"}
-
-last_news_alert_time = 0
-seen_news_titles = {}
-seen_news_groups = {}
-
-market_cache = {
-    "macro_bias": "neutral",
-    "btc_1h": 0.0,
-    "btc_24h": 0.0,
-    "eth_1h": 0.0,
-    "eth_24h": 0.0,
-    "btc_price": 0.0,
-    "eth_price": 0.0,
-    "btc_vol": 0.0,
-    "eth_vol": 0.0,
-    "updated_at": 0.0,
-}
 
 # =========================================================
 # TOKENS
 # =========================================================
 TOKENS = [
-    {"symbol": "PLS", "search": "PLS pulsechain", "label": "🟢 PLS"},
-    {"symbol": "PLSX", "search": "PLSX pulsechain", "label": "🟣 PLSX"},
-    {"symbol": "PROVEX", "search": "PROVEX pulsechain", "label": "🧪 PROVEX"},
+    {
+        "symbol": "PLS",
+        "label": "🟢 PLS",
+        "search": "PLS pulsechain",
+        "contract": "0xa1077a294dde1b09bb078844df40758a5d0f9a27",
+    },
+    {
+        "symbol": "PLSX",
+        "label": "🟣 PLSX",
+        "search": "PLSX pulsechain",
+        "contract": "0x95b303987a60c71504d99aa1b13b4da07b0790ab",
+    },
+    {
+        "symbol": "PRVX",
+        "label": "🧪 PRVX",
+        "search": "PRVX pulsechain",
+        "contract": "0xF6f8Db0aBa00007681F8fAF16A0FDa1c9B030b11",
+    },
 ]
 
 # =========================================================
@@ -77,8 +58,29 @@ GREEN = 0x2ECC71
 RED = 0xE74C3C
 YELLOW = 0xF1C40F
 BLUE = 0x3498DB
-ORANGE = 0xE67E22
 PURPLE = 0x8E44AD
+
+# =========================================================
+# STATE
+# =========================================================
+last_token_states = {t["symbol"]: "neutral" for t in TOKENS}
+last_token_signals = {t["symbol"]: None for t in TOKENS}
+last_token_alert_time = {t["symbol"]: 0 for t in TOKENS}
+
+last_rotation_state = None
+last_rotation_alert_time = 0
+
+last_macro_signal = None
+last_macro_alert_time = 0
+
+market_cache = {
+    "bias": "neutral",
+    "btc_24h": 0.0,
+    "eth_24h": 0.0,
+    "updated_at": 0.0,
+}
+
+latest_token_market = {}
 
 # =========================================================
 # HELPERS
@@ -87,92 +89,112 @@ def log(*args):
     if DEBUG:
         print("[DEBUG]", *args, flush=True)
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def utc_stamp():
-    return now_utc().strftime("%Y-%m-%d %H:%M UTC")
-
 def safe_float(v, default=0.0):
     try:
         return float(v or 0)
     except Exception:
         return default
 
+def safe_int(v, default=0):
+    try:
+        return int(v or 0)
+    except Exception:
+        return default
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def can_send_again(last_sent_ts, cooldown_seconds):
-    return (time.time() - float(last_sent_ts or 0)) >= cooldown_seconds
+def can_send_again(last_ts, cooldown_seconds):
+    return (time.time() - float(last_ts or 0)) >= cooldown_seconds
 
-def normalize_text(s):
-    s = html.unescape(s or "")
-    s = s.lower().strip()
-    s = re.sub(r"https?://\S+", "", s)
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def strip_source_suffix(title):
-    t = title or ""
-    t = re.sub(r"\s*[-–|]\s*[^-–|]{1,40}$", "", t).strip()
-    return t
-
-def normalized_title_key(title):
-    return normalize_text(strip_source_suffix(title))
-
-def normalized_group_key(text):
-    text = normalize_text(text)
-    replacements = [
-        ("federal reserve", "fed"),
-        ("exchange traded fund", "etf"),
-        ("ethereum etf", "eth etf"),
-        ("bitcoin etf", "btc etf"),
-        ("bank collapse", "bank stress"),
-        ("bank failure", "bank stress"),
-        ("hack", "security breach"),
-        ("exploit", "security breach"),
-    ]
-    for a, b in replacements:
-        text = text.replace(a, b)
-    return text[:140]
-
-def cleanup_seen_news():
-    now_ts = time.time()
-    stale_after = 60 * 60 * 24 * 2
-    for d in (seen_news_titles, seen_news_groups):
-        old_keys = [k for k, ts in d.items() if (now_ts - ts) > stale_after]
-        for k in old_keys:
-            d.pop(k, None)
+def footer_stamp():
+    return utc_now().strftime("%Y-%m-%d %H:%M UTC")
 
 def send_embed(title, description, color=PURPLE, url=None):
+    if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
+        print("Webhook not set correctly. Put your Discord webhook in DISCORD_WEBHOOK.", flush=True)
+        return
+
     embed = {
         "title": title,
         "description": description,
         "color": color,
-        "footer": {"text": f"PulseChain Rotation Agent • {utc_stamp()}"},
+        "footer": {"text": f"PulseChain Rotation Agent • {footer_stamp()}"},
     }
     if url:
         embed["url"] = url
 
     payload = {"embeds": [embed]}
+
     try:
         r = client.post(DISCORD_WEBHOOK, json=payload)
         r.raise_for_status()
         print(f"[SEND] {title}", flush=True)
     except Exception as e:
-        print("Webhook embed error:", e, flush=True)
+        print("Webhook error:", e, flush=True)
+
+# =========================================================
+# MACRO
+# =========================================================
+def refresh_macro():
+    if (time.time() - market_cache.get("updated_at", 0)) < MACRO_CACHE_SECONDS:
+        return
+
+    try:
+        r = client.get(
+            COINGECKO_MARKETS,
+            params={
+                "vs_currency": "usd",
+                "ids": "bitcoin,ethereum",
+                "price_change_percentage": "24h",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        coin_map = {c["id"]: c for c in data}
+        btc = coin_map.get("bitcoin")
+        eth = coin_map.get("ethereum")
+
+        if not btc or not eth:
+            print("Macro refresh: BTC or ETH missing", flush=True)
+            return
+
+        btc_24 = safe_float(btc.get("price_change_percentage_24h"))
+        eth_24 = safe_float(eth.get("price_change_percentage_24h"))
+        avg = (btc_24 + eth_24) / 2.0
+
+        if avg >= 2.0:
+            bias = "bullish"
+        elif avg <= -2.0:
+            bias = "bearish"
+        else:
+            bias = "neutral"
+
+        market_cache.update(
+            {
+                "bias": bias,
+                "btc_24h": btc_24,
+                "eth_24h": eth_24,
+                "updated_at": time.time(),
+            }
+        )
+        print("Macro refreshed", flush=True)
+
+    except Exception as e:
+        print("Macro refresh error:", e, flush=True)
 
 # =========================================================
 # DEXSCREENER
 # =========================================================
-def fetch_token_market(search_term):
+def fetch_token_dex(search_term):
     try:
-        url = "https://api.dexscreener.com/latest/dex/search"
-        r = client.get(url, params={"q": search_term})
+        r = client.get(DEX_SEARCH_URL, params={"q": search_term})
         r.raise_for_status()
-        data = r.json()
-        pairs = data.get("pairs", [])
+        pairs = r.json().get("pairs", [])
 
         if not pairs:
             return None
@@ -188,30 +210,23 @@ def fetch_token_market(search_term):
             buys = safe_float(tx_h1.get("buys"))
             sells = safe_float(tx_h1.get("sells"))
 
-            pair_score = 0.0
-            pair_score += liq * 0.58
-            pair_score += vol_h24 * 0.34
-            pair_score += (buys + sells) * 45
-
+            s = liq * 0.60 + vol_h24 * 0.30 + (buys + sells) * 50
             if liq < 25_000:
-                pair_score *= 0.65
-            if vol_h24 < 15_000:
-                pair_score *= 0.78
-
-            return pair_score
+                s *= 0.70
+            return s
 
         best = sorted(pairs, key=score, reverse=True)[0]
 
-        txns_h1 = (best.get("txns") or {}).get("h1") or {}
-        txns_h24 = (best.get("txns") or {}).get("h24") or {}
+        tx1 = (best.get("txns") or {}).get("h1") or {}
+        tx24 = (best.get("txns") or {}).get("h24") or {}
         liquidity = best.get("liquidity") or {}
         volume = best.get("volume") or {}
         price_change = best.get("priceChange") or {}
 
-        buys_h1 = safe_float(txns_h1.get("buys"))
-        sells_h1 = safe_float(txns_h1.get("sells"))
-        buys_h24 = safe_float(txns_h24.get("buys"))
-        sells_h24 = safe_float(txns_h24.get("sells"))
+        buys_h1 = safe_float(tx1.get("buys"))
+        sells_h1 = safe_float(tx1.get("sells"))
+        buys_h24 = safe_float(tx24.get("buys"))
+        sells_h24 = safe_float(tx24.get("sells"))
 
         ratio_h1 = buys_h1 / max(1.0, sells_h1)
         ratio_h24 = buys_h24 / max(1.0, sells_h24)
@@ -225,752 +240,448 @@ def fetch_token_market(search_term):
         h6_change = safe_float(price_change.get("h6"))
         h24_change = safe_float(price_change.get("h24"))
 
-        volume_to_liquidity = vol_h1 / max(liq_usd, 1.0)
-
-        flow_score = 0.0
-        flow_score += clamp(min(4.0, ratio_h1) * 1.55, 0, 6.2)
-        flow_score += clamp((volume_to_liquidity / 0.05) * 2.2, 0, 3.0)
-
-        if h1_change < 0 and ratio_h1 >= 1.2:
-            flow_score += 1.5
-        if h6_change < 0 and ratio_h24 >= 1.05:
-            flow_score += 1.0
-        if h1_change > 0:
-            flow_score += 0.8
-        if h6_change > 0:
-            flow_score += 1.0
-
-        if liq_usd >= 1_000_000:
-            flow_score += 1.8
-        elif liq_usd >= 250_000:
-            flow_score += 1.2
-        elif liq_usd >= 75_000:
-            flow_score += 0.8
-
-        flow_score = clamp(flow_score, 0, 10)
-
-        fake_pump_risk = 0.0
-        if h1_change > 8 and ratio_h1 < 1.05:
-            fake_pump_risk += 2.5
-        if liq_usd < 50_000 and h1_change > 5:
-            fake_pump_risk += 2.0
-        if vol_h1 < 5_000 and h1_change > 4:
-            fake_pump_risk += 1.0
-
-        confidence = flow_score
-        confidence += 0.6 if liq_usd >= 100_000 else 0.0
-        confidence += 0.5 if ratio_h1 >= 1.25 else 0.0
-        confidence -= fake_pump_risk
-        confidence = clamp(confidence, 1, 10)
+        vol_liq_ratio = vol_h1 / max(liq_usd, 1.0)
 
         return {
-            "symbol": best.get("baseToken", {}).get("symbol") or search_term.split()[0],
             "url": best.get("url") or "",
             "liq_usd": liq_usd,
             "vol_h1": vol_h1,
             "vol_h6": vol_h6,
             "vol_h24": vol_h24,
-            "buys_h1": buys_h1,
-            "sells_h1": sells_h1,
-            "buys_h24": buys_h24,
-            "sells_h24": sells_h24,
             "ratio_h1": ratio_h1,
             "ratio_h24": ratio_h24,
+            "buys_h1": buys_h1,
+            "sells_h1": sells_h1,
             "h1_change": h1_change,
             "h6_change": h6_change,
             "h24_change": h24_change,
-            "vol_liq_ratio_h1": volume_to_liquidity,
-            "flow_score": flow_score,
-            "confidence": confidence,
-            "fake_pump_risk": fake_pump_risk,
+            "vol_liq_ratio": vol_liq_ratio,
         }
 
     except Exception as e:
-        print("Dex fetch error:", search_term, e, flush=True)
+        print(f"Dex fetch error ({search_term}):", e, flush=True)
         return None
 
 # =========================================================
-# MACRO CACHE
+# PULSECHAIN SCAN LAYER
 # =========================================================
-def refresh_macro_market(force=False):
-    global market_cache
-
-    if not force and (time.time() - market_cache.get("updated_at", 0)) < MACRO_CACHE_SECONDS:
-        log("Macro cache still fresh, skipping refresh")
-        return
-
+def pulsescan_txlist(contract_address, offset=80):
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "ids": "bitcoin,ethereum",
-            "price_change_percentage": "1h,24h"
-        }
-        r = client.get(url, params=params)
+        r = client.get(
+            PULSESCAN_API,
+            params={
+                "module": "account",
+                "action": "txlist",
+                "address": contract_address,
+                "page": 1,
+                "offset": offset,
+                "sort": "desc",
+            },
+        )
         r.raise_for_status()
         data = r.json()
-
-        coin_map = {c["id"]: c for c in data}
-        btc = coin_map.get("bitcoin")
-        eth = coin_map.get("ethereum")
-
-        if not btc or not eth:
-            print("Macro refresh error: BTC or ETH missing", flush=True)
-            return
-
-        btc_1h = safe_float(btc.get("price_change_percentage_1h_in_currency"))
-        btc_24h = safe_float(btc.get("price_change_percentage_24h"))
-        eth_1h = safe_float(eth.get("price_change_percentage_1h_in_currency"))
-        eth_24h = safe_float(eth.get("price_change_percentage_24h"))
-
-        avg = (btc_24h + eth_24h) / 2.0
-
-        bias = "neutral"
-        if avg >= 2.2:
-            bias = "bullish"
-        elif avg <= -2.2:
-            bias = "bearish"
-
-        market_cache.update({
-            "macro_bias": bias,
-            "btc_1h": btc_1h,
-            "btc_24h": btc_24h,
-            "eth_1h": eth_1h,
-            "eth_24h": eth_24h,
-            "btc_price": safe_float(btc.get("current_price")),
-            "eth_price": safe_float(eth.get("current_price")),
-            "btc_vol": safe_float(btc.get("total_volume")),
-            "eth_vol": safe_float(eth.get("total_volume")),
-            "updated_at": time.time(),
-        })
-
-        print("Macro market refreshed successfully", flush=True)
-
+        result = data.get("result", [])
+        if isinstance(result, list):
+            return result
+        return []
     except Exception as e:
-        print("Macro refresh error:", e, flush=True)
+        print(f"PulseScan txlist error ({contract_address}):", e, flush=True)
+        return []
 
-def macro_alignment_bonus(token_market):
-    bias = market_cache.get("macro_bias", "neutral")
-    h1 = token_market["h1_change"]
-    h6 = token_market["h6_change"]
+def analyze_scan_activity(contract_address):
+    txs = pulsescan_txlist(contract_address, offset=80)
 
-    bonus = 0.0
-    if bias == "bullish" and (h1 > 0 or h6 > 0):
-        bonus += 0.8
-    elif bias == "bearish" and (h1 < 0 or h6 < 0):
-        bonus += 0.4
-    elif bias == "bearish" and (h1 > 0 and h6 > 0):
-        bonus -= 0.7
+    if not txs:
+        return {
+            "recent_tx_count": 0,
+            "unique_from_count": 0,
+            "activity_score": 0.0,
+            "whale_hint": 0.0,
+        }
 
-    return bonus
+    now_ts = int(time.time())
+    recent_30m = 0
+    recent_2h = 0
+    unique_from = set()
+    unique_to = set()
+
+    for tx in txs:
+        ts = safe_int(tx.get("timeStamp"))
+        if ts <= 0:
+            continue
+
+        age = now_ts - ts
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower()
+
+        if from_addr:
+            unique_from.add(from_addr)
+        if to_addr:
+            unique_to.add(to_addr)
+
+        if age <= 1800:
+            recent_30m += 1
+        if age <= 7200:
+            recent_2h += 1
+
+    activity_score = 0.0
+    activity_score += clamp(recent_30m / 8.0, 0, 4.0)
+    activity_score += clamp(recent_2h / 18.0, 0, 3.0)
+    activity_score += clamp(len(unique_from) / 20.0, 0, 2.0)
+    activity_score += clamp(len(unique_to) / 20.0, 0, 1.5)
+    activity_score = clamp(activity_score, 0, 10)
+
+    whale_hint = 0.0
+    if recent_30m >= 10:
+        whale_hint += 2.0
+    if len(unique_from) >= 12:
+        whale_hint += 1.5
+    if recent_2h >= 25:
+        whale_hint += 1.5
+    whale_hint = clamp(whale_hint, 0, 5.0)
+
+    return {
+        "recent_tx_count": recent_30m,
+        "unique_from_count": len(unique_from),
+        "activity_score": activity_score,
+        "whale_hint": whale_hint,
+    }
 
 # =========================================================
-# TOKEN SIGNALS
+# MERGE MARKET LAYERS
 # =========================================================
-def derive_token_state(m):
+def build_market_snapshot(token):
+    dex = fetch_token_dex(token["search"])
+    if not dex:
+        return None
+
+    scan = analyze_scan_activity(token["contract"])
+
+    whale_pressure = 0.0
+    whale_pressure += clamp((dex["vol_h1"] / max(dex["liq_usd"] * 0.08, 1.0)), 0, 4.0)
+    if dex["ratio_h1"] >= 1.30:
+        whale_pressure += 2.0
+    elif dex["ratio_h1"] >= 1.15:
+        whale_pressure += 1.0
+    if dex["h1_change"] < 0 and dex["ratio_h1"] >= 1.15:
+        whale_pressure += 1.5
+    whale_pressure += scan["whale_hint"]
+    whale_pressure = clamp(whale_pressure, 0, 10)
+
+    accumulation_score = 0.0
+    accumulation_score += clamp(min(4.0, dex["ratio_h1"]) * 1.5, 0, 6.0)
+    accumulation_score += 1.2 if dex["vol_liq_ratio"] >= 0.04 else 0.0
+    accumulation_score += 1.2 if dex["h1_change"] < 0 and dex["ratio_h1"] >= 1.1 else 0.0
+    accumulation_score += 0.8 if dex["h6_change"] > 0 else 0.0
+    accumulation_score += 0.6 if dex["liq_usd"] >= 100_000 else 0.0
+    accumulation_score += clamp(scan["activity_score"] * 0.22, 0, 2.0)
+    accumulation_score = clamp(accumulation_score, 0, 10)
+
+    sell_pressure = 0.0
+    if dex["ratio_h1"] < 1.0:
+        sell_pressure += 2.5
+    if dex["h1_change"] <= -3:
+        sell_pressure += 1.5
+    if dex["h6_change"] <= -6:
+        sell_pressure += 1.8
+    if dex["vol_liq_ratio"] >= 0.04 and dex["ratio_h1"] < 1.0:
+        sell_pressure += 1.2
+    if scan["activity_score"] >= 5.5 and dex["ratio_h1"] < 1.0:
+        sell_pressure += 1.0
+    sell_pressure = clamp(sell_pressure, 0, 10)
+
+    merged = {}
+    merged.update(dex)
+    merged.update(scan)
+    merged["whale_pressure"] = whale_pressure
+    merged["accumulation_score"] = accumulation_score
+    merged["sell_pressure"] = sell_pressure
+    return merged
+
+# =========================================================
+# TOKEN SIGNAL ENGINE
+# =========================================================
+def derive_token_signal(symbol, m):
     ratio = m["ratio_h1"]
-    flow = m["flow_score"]
     h1 = m["h1_change"]
     h6 = m["h6_change"]
-    conf = m["confidence"]
-    fake_risk = m["fake_pump_risk"]
+    whale = m["whale_pressure"]
+    accumulation = m["accumulation_score"]
+    sell_pressure = m["sell_pressure"]
+    macro_bias = market_cache.get("bias", "neutral")
 
-    if (h1 <= -8 or h6 <= -15) and ratio >= 1.35 and flow >= 6.2:
-        return "dip_buy", "bullish", "شراء الآن"
+    state = "neutral"
+    mood = "neutral"
+    action = "خليك كاش — انتظار"
 
-    if h1 <= -8 and ratio < 1.0 and conf < 5:
-        return "flush", "bearish", "لا دخول — انتبه"
+    if accumulation >= 6.5 and ratio >= 1.20:
+        if h1 < 0:
+            state = "accumulate"
+            mood = "bullish"
+            action = "راقب — دخول تدريجي"
+        else:
+            state = "strong"
+            mood = "bullish"
+            action = "عزّز بشكل تدريجي"
 
-    if flow >= 7.4 and ratio >= 1.30 and h1 >= -2:
-        if h1 >= 2 or h6 >= 5:
-            return "breakout", "bullish", "راقب الاختراق — لا تطارد"
-        return "strong", "bullish", "عزّز بشكل تدريجي"
+    if whale >= 7.0 and ratio >= 1.25:
+        state = "strong"
+        mood = "bullish"
+        action = "راقب — لا تطارد"
 
-    if flow >= 5.8 and ratio >= 1.12:
-        return "buildup", "watch", "راقب — دخول تدريجي"
+    if sell_pressure >= 5.5 and ratio < 1.0:
+        state = "sell"
+        mood = "bearish"
+        action = "خليك كاش — خطر"
 
-    if h1 <= -6 or h6 <= -10:
-        if ratio >= 1.05:
-            return "buildup", "watch", "راقب الارتداد — لا تستعجل"
-        return "risk", "bearish", "خليك كاش — خطر"
+    if h1 <= -8 and ratio < 0.95:
+        state = "flush"
+        mood = "bearish"
+        action = "لا دخول — انتبه"
 
-    if fake_risk >= 2.5:
-        return "risk", "bearish", "لا تطارد — انتظر تأكيد"
+    if macro_bias == "bearish" and mood == "bullish" and h1 <= 0:
+        state = "watch"
+        mood = "watch"
+        action = "راقب — لا تستعجل"
 
-    return "neutral", "neutral", "خليك كاش — انتظار"
-
-def token_summary_line(symbol, state):
     if symbol == "PLS":
-        if state in ("strong", "breakout", "dip_buy", "buildup"):
-            return "🧠 السوق عم يجمع بولس"
-        if state in ("risk", "flush"):
-            return "🧠 في ضغط بيع على بولس"
-        return "🧠 بولس بدون اتجاه واضح"
-
-    if symbol == "PLSX":
-        if state in ("strong", "breakout", "dip_buy", "buildup"):
-            return "🧠 السوق عم يجمع بولس اكس"
-        if state in ("risk", "flush"):
-            return "🧠 في ضغط بيع على بولس اكس"
-        return "🧠 بولس اكس بدون اتجاه واضح"
-
-    if symbol == "PROVEX":
-        if state in ("strong", "breakout", "dip_buy", "buildup"):
-            return "🧠 في تجميع على PROVEX"
-        if state in ("risk", "flush"):
-            return "🧠 PROVEX تحت ضغط"
-        return "🧠 PROVEX هادئة"
-
-    return "🧠 السوق غير واضح"
-
-def token_reason_lines(m, mood):
-    lines = []
-
-    if mood == "bullish":
-        if m["ratio_h1"] >= 1.2:
-            lines.append("📈 المشترين أقوى من البائعين")
-        if m["h1_change"] < 0 and m["ratio_h1"] >= 1.1:
-            lines.append("🛡️ الهبوط عم ينشفط شراء")
-        if m["vol_liq_ratio_h1"] >= 0.04:
-            lines.append("💧 في تدفق سيولة حقيقي")
-        if market_cache.get("macro_bias") == "bullish":
-            lines.append("🌤️ السوق العام مساعد")
-
-    elif mood == "bearish":
-        if m["ratio_h1"] < 1.0:
-            lines.append("📉 البائعين أقوى من المشترين")
-        if m["h1_change"] <= -4 or m["h6_change"] <= -8:
-            lines.append("🌧️ في ضغط نزول واضح")
-        if market_cache.get("macro_bias") == "bearish":
-            lines.append("⚠️ السوق العام سلبي")
-        if m["fake_pump_risk"] >= 2.5:
-            lines.append("🔥 الحركة شكلها مو نظيف")
-
-    elif mood == "watch":
-        if m["ratio_h1"] >= 1.05:
-            lines.append("👀 في مراقبة وتجميع خفيف")
-        if m["h1_change"] < 0:
-            lines.append("↩️ احتمال ارتداد إذا ثبت الشراء")
-        if market_cache.get("macro_bias") == "neutral":
-            lines.append("🫥 السوق العام محايد")
-
-    return lines[:3]
-
-def build_token_signal(symbol, label, m):
-    state, mood, action_ar = derive_token_state(m)
-    confidence = clamp(m["confidence"] + macro_alignment_bonus(m), 1, 10)
-
-    line1 = token_summary_line(symbol, state)
-    reason_lines = token_reason_lines(m, mood)
-
-    if mood == "bullish":
-        color = GREEN
-        mood_emoji = "🟢"
-    elif mood == "bearish":
-        color = RED
-        mood_emoji = "🔴"
-    elif mood == "watch":
-        color = YELLOW
-        mood_emoji = "🟡"
+        if state in ("accumulate", "strong"):
+            summary = "🧠 السوق عم يجمع بولس"
+        elif state in ("sell", "flush"):
+            summary = "🧠 في ضغط بيع على بولس"
+        elif state == "watch":
+            summary = "🧠 بولس تحت المراقبة"
+        else:
+            summary = "🧠 بولس هادئة"
+    elif symbol == "PLSX":
+        if state in ("accumulate", "strong"):
+            summary = "🧠 السوق عم يجمع بولس اكس"
+        elif state in ("sell", "flush"):
+            summary = "🧠 في ضغط بيع على بولس اكس"
+        elif state == "watch":
+            summary = "🧠 بولس اكس تحت المراقبة"
+        else:
+            summary = "🧠 بولس اكس هادئة"
     else:
-        color = PURPLE
-        mood_emoji = "⚪"
+        if state in ("accumulate", "strong"):
+            summary = "🧠 في تجميع على PRVX"
+        elif state in ("sell", "flush"):
+            summary = "🧠 PRVX تحت ضغط"
+        elif state == "watch":
+            summary = "🧠 PRVX تحت المراقبة"
+        else:
+            summary = "🧠 PRVX هادئة"
 
-    compact_conf = ""
-    if confidence >= 8.5:
-        compact_conf = "✅ الثقة عالية"
-    elif confidence >= 7:
-        compact_conf = "☑️ الإشارة جيدة"
-    elif mood in ("bullish", "bearish", "watch"):
-        compact_conf = "🪫 الإشارة متوسطة"
+    reasons = []
+    if mood == "bullish":
+        reasons.append("📈 المشترين أقوى")
+        if h1 < 0 and ratio >= 1.1:
+            reasons.append("🛡️ الهبوط عم ينشفط")
+        elif h6 > 0:
+            reasons.append("⚡ الحركة تتحسن")
+        if macro_bias == "bullish":
+            reasons.append("🌤️ السوق العام مساعد")
+    elif mood == "bearish":
+        reasons.append("📉 البائعين أقوى")
+        if h6 <= -6:
+            reasons.append("🌧️ الضغط واضح")
+        if macro_bias == "bearish":
+            reasons.append("⚠️ السوق العام سلبي")
+    elif mood == "watch":
+        reasons.append("👀 في حركة لكن مو مؤكدة")
+        reasons.append("🫥 بدها تأكيد")
 
-    lines = [line1]
-    lines.extend(reason_lines)
-    if compact_conf:
-        lines.append(compact_conf)
+    return {
+        "state": state,
+        "mood": mood,
+        "summary": summary,
+        "reasons": reasons[:2],
+        "action": action,
+    }
 
-    desc = "\n".join(f"- {x}" for x in lines)
-    desc += f"\n\n👉 **Take Action:** {action_ar}"
-
-    title = f"{mood_emoji} {label}"
-    return state, mood, confidence, title, desc, color
-
-def should_send_token_alert(symbol, state, mood, confidence, current_signal):
-    previous_state = last_token_states.get(symbol, "neutral")
-    previous_signal = last_token_signals.get(symbol)
+def should_send_token_alert(symbol, signal_key, state):
+    prev_state = last_token_states.get(symbol, "neutral")
+    prev_signal = last_token_signals.get(symbol)
     cooldown_ok = can_send_again(last_token_alert_time.get(symbol), TOKEN_ALERT_COOLDOWN_SECONDS)
-
-    state_changed = state != previous_state
-    signal_changed = current_signal != previous_signal
 
     if state == "neutral":
         return False
-
-    if previous_state == "neutral":
+    if prev_state == "neutral":
         return True
-
-    if state_changed:
+    if prev_state != state:
         return True
-
-    if signal_changed and cooldown_ok and confidence >= 6.2:
+    if prev_signal != signal_key and cooldown_ok:
         return True
-
-    if cooldown_ok and mood in ("bullish", "bearish") and confidence >= 8.0:
-        return True
-
     return False
 
 def monitor_tokens():
-    global last_token_signals, last_token_alert_time, last_token_states
+    global latest_token_market
+
+    latest_token_market = {}
 
     for token in TOKENS:
-        market = fetch_token_market(token["search"])
-        log(token["symbol"], "market =", market)
-
-        if not market:
-            print(f"[TOKEN] {token['symbol']} no market data", flush=True)
-            continue
-
         symbol = token["symbol"]
         label = token["label"]
 
-        state, mood, confidence, title, desc, color = build_token_signal(symbol, label, market)
+        market = build_market_snapshot(token)
+        if not market:
+            print(f"[TOKEN] {symbol} no market data", flush=True)
+            continue
 
-        current_signal = (
+        latest_token_market[symbol] = market
+        signal = derive_token_signal(symbol, market)
+
+        state = signal["state"]
+        mood = signal["mood"]
+
+        signal_key = (
             f"{state}|{mood}|"
-            f"{round(market['h1_change'],1)}|"
-            f"{round(market['h6_change'],1)}|"
-            f"{round(market['ratio_h1'],2)}|"
-            f"{round(market['flow_score'],1)}|"
-            f"{round(confidence,1)}"
+            f"{round(market['ratio_h1'], 2)}|"
+            f"{round(market['h1_change'], 1)}|"
+            f"{round(market['h6_change'], 1)}|"
+            f"{round(market['whale_pressure'], 1)}|"
+            f"{round(market['accumulation_score'], 1)}|"
+            f"{round(market['sell_pressure'], 1)}|"
+            f"{round(market['activity_score'], 1)}"
         )
 
-        print(f"[TOKEN] {symbol} state={state} mood={mood} confidence={confidence:.1f}", flush=True)
-        print(f"[TOKEN] {symbol} signal={current_signal}", flush=True)
-        print(
-            f"[TOKEN] {symbol} prev_state={last_token_states.get(symbol)} prev_signal={last_token_signals.get(symbol)}",
-            flush=True
-        )
+        print(f"[TOKEN] {symbol} state={state} mood={mood} key={signal_key}", flush=True)
 
-        if should_send_token_alert(symbol, state, mood, confidence, current_signal):
-            send_embed(title, desc, color, url=market.get("url") or None)
-            last_token_alert_time[symbol] = time.time()
+        if not should_send_token_alert(symbol, signal_key, state):
+            last_token_states[symbol] = state
+            last_token_signals[symbol] = signal_key
+            continue
 
-        last_token_signals[symbol] = current_signal
-        last_token_states[symbol] = state
-
-# =========================================================
-# RICHARD HEART
-# =========================================================
-def monitor_richard_heart():
-    global last_richard_status
-    try:
-        r = client.get("https://richardheart.com/")
-        online = 200 <= r.status_code < 400
-    except Exception:
-        online = False
-
-    if last_richard_status is None:
-        last_richard_status = online
-        return
-
-    if online != last_richard_status:
-        if online:
-            send_embed(
-                "🟢 RichardHeart.com",
-                "- 🧠 الموقع رجع أونلاين\n- 👀 احتمال في نشاط أو حركة قريبة\n\n👉 **Take Action:** راقب لاحتمال عودة النشاط أو بث",
-                GREEN,
-                url="https://richardheart.com/"
-            )
+        if mood == "bullish":
+            color = GREEN
+            icon = "🟢"
+        elif mood == "bearish":
+            color = RED
+            icon = "🔴"
+        elif mood == "watch":
+            color = YELLOW
+            icon = "🟡"
         else:
-            send_embed(
-                "🔴 RichardHeart.com",
-                "- 🧠 الموقع أوفلاين الآن\n- 😴 ما في تغيير مهم حاليًا\n\n👉 **Take Action:** لا تغيير حالياً",
-                RED,
-                url="https://richardheart.com/"
-            )
-        last_richard_status = online
+            color = PURPLE
+            icon = "⚪"
 
-def daily_richard_heart_update():
-    global last_richard_daily_date
-    today = now_utc().date()
+        lines = [signal["summary"]]
+        lines.extend(signal["reasons"])
 
-    if last_richard_daily_date == today:
+        desc = "\n".join(f"- {x}" for x in lines)
+        desc += f"\n\n👉 **Take Action:** {signal['action']}"
+
+        send_embed(f"{icon} {label}", desc, color, url=market.get("url") or None)
+
+        last_token_alert_time[symbol] = time.time()
+        last_token_states[symbol] = state
+        last_token_signals[symbol] = signal_key
+
+# =========================================================
+# ROTATION ENGINE
+# =========================================================
+def detect_rotation():
+    pls = latest_token_market.get("PLS")
+    plsx = latest_token_market.get("PLSX")
+
+    if not pls or not plsx:
+        return None
+
+    pls_strength = (
+        pls["accumulation_score"] * 0.42 +
+        pls["whale_pressure"] * 0.28 +
+        clamp(pls["ratio_h1"], 0, 3) * 1.20 +
+        clamp(pls["activity_score"], 0, 10) * 0.22 +
+        (0.5 if pls["h1_change"] > 0 else 0.0)
+    )
+
+    plsx_strength = (
+        plsx["accumulation_score"] * 0.42 +
+        plsx["whale_pressure"] * 0.28 +
+        clamp(plsx["ratio_h1"], 0, 3) * 1.20 +
+        clamp(plsx["activity_score"], 0, 10) * 0.22 +
+        (0.5 if plsx["h1_change"] > 0 else 0.0)
+    )
+
+    diff = plsx_strength - pls_strength
+
+    if diff >= 2.2 and plsx["ratio_h1"] >= 1.15:
+        return {
+            "state": "to_plsx",
+            "title": "🟣 Rotation Alert",
+            "desc": "- 🧠 في انتقال سيولة نحو بولس اكس\n- ⚡ بولس اكس عم تبين أقوى من بولس\n\n👉 **Take Action:** راقب بولس اكس أكثر",
+            "color": BLUE,
+        }
+
+    if diff <= -2.2 and pls["ratio_h1"] >= 1.15:
+        return {
+            "state": "to_pls",
+            "title": "🟢 Rotation Alert",
+            "desc": "- 🧠 في انتقال سيولة نحو بولس\n- ⚡ بولس عم تبين أقوى من بولس اكس\n\n👉 **Take Action:** راقب بولس أكثر",
+            "color": BLUE,
+        }
+
+    return None
+
+def monitor_rotation():
+    global last_rotation_state, last_rotation_alert_time
+
+    rotation = detect_rotation()
+    if not rotation:
         return
 
-    try:
-        r = client.get("https://richardheart.com/")
-        online = 200 <= r.status_code < 400
-    except Exception:
-        online = False
+    state = rotation["state"]
+    cooldown_ok = can_send_again(last_rotation_alert_time, ROTATION_ALERT_COOLDOWN_SECONDS)
 
-    if online:
+    if state == last_rotation_state and not cooldown_ok:
+        return
+
+    send_embed(rotation["title"], rotation["desc"], rotation["color"])
+    last_rotation_state = state
+    last_rotation_alert_time = time.time()
+
+# =========================================================
+# MACRO ALERTS
+# =========================================================
+def monitor_macro():
+    global last_macro_signal, last_macro_alert_time
+
+    bias = market_cache.get("bias", "neutral")
+
+    if bias == "neutral":
+        return
+
+    if bias == last_macro_signal and not can_send_again(last_macro_alert_time, MACRO_ALERT_COOLDOWN_SECONDS):
+        return
+
+    if bias == "bullish":
         send_embed(
-            "🟢 RichardHeart.com — Daily Update",
-            "- 🌞 الموقع أونلاين اليوم\n- 👀 خليك منتبه لأي نشاط\n\n👉 **Take Action:** راقب لأي نشاط أو بث",
+            "🟢 ₿ Bitcoin / ⟠ Ethereum",
+            "- 🧠 السوق العام إيجابي\n- 🌤️ هذا الشي ممكن يساعد الألتات\n\n👉 **Take Action:** راقب الزخم — لا تطارد",
             GREEN,
-            url="https://richardheart.com/"
         )
     else:
         send_embed(
-            "🔴 RichardHeart.com — Daily Update",
-            "- 🌙 الموقع أوفلاين اليوم\n- 💤 ما في جديد مهم\n\n👉 **Take Action:** لا تغيير اليوم",
+            "🔴 ₿ Bitcoin / ⟠ Ethereum",
+            "- 🧠 السوق العام تحت ضغط\n- ⚠️ هذا الشي يضغط على الألتات\n\n👉 **Take Action:** خفف الاندفاع — انتبه",
             RED,
-            url="https://richardheart.com/"
         )
 
-    last_richard_daily_date = today
-
-# =========================================================
-# BTC / ETH
-# =========================================================
-def monitor_btc_eth():
-    global last_btc_eth_signals, last_macro_alert_time
-
-    try:
-        for coin_id, label in [("bitcoin", "₿ Bitcoin"), ("ethereum", "⟠ Ethereum")]:
-            if coin_id == "bitcoin":
-                ch1 = market_cache["btc_1h"]
-                ch24 = market_cache["btc_24h"]
-            else:
-                ch1 = market_cache["eth_1h"]
-                ch24 = market_cache["eth_24h"]
-
-            signal = None
-            mood = None
-            action_ar = None
-            summary = None
-
-            if ch1 >= 3.0 or ch24 >= 5.0:
-                signal = "up"
-                mood = "bullish"
-                summary = "🧠 السوق عم يدفع لفوق"
-                action_ar = "راقب الزخم — لا تطارد"
-
-            elif ch1 <= -3.0 or ch24 <= -5.0:
-                signal = "down"
-                mood = "bearish"
-                summary = "🧠 في ضغط بيع واضح"
-                action_ar = "راقب الدعم — لا تستعجل"
-
-            if not signal:
-                continue
-
-            same_signal = last_btc_eth_signals.get(coin_id) == signal
-            cooldown_ok = can_send_again(last_macro_alert_time.get(coin_id), MACRO_ALERT_COOLDOWN_SECONDS)
-
-            if same_signal and not cooldown_ok:
-                continue
-
-            if mood == "bullish":
-                color = GREEN
-                lines = [
-                    summary,
-                    "📈 الحركة قوية على الماكرو",
-                    "🌤️ هذا الشي ممكن يساعد الألتات",
-                ]
-            else:
-                color = RED
-                lines = [
-                    summary,
-                    "📉 السوق العام متوتر",
-                    "⚠️ هذا الشي يضغط على الألتات",
-                ]
-
-            desc = "\n".join(f"- {x}" for x in lines)
-            desc += f"\n\n👉 **Take Action:** {action_ar}"
-
-            icon = "🟢" if signal == "up" else "🔴"
-            send_embed(f"{icon} {label}", desc, color)
-
-            last_btc_eth_signals[coin_id] = signal
-            last_macro_alert_time[coin_id] = time.time()
-
-    except Exception as e:
-        print("BTC/ETH error:", e, flush=True)
-
-# =========================================================
-# DAILY MARKET INSIGHT
-# =========================================================
-def daily_market_insight():
-    global last_market_insight_date
-    today = now_utc().date()
-
-    if last_market_insight_date == today:
-        return
-
-    try:
-        btc_24 = market_cache["btc_24h"]
-        eth_24 = market_cache["eth_24h"]
-        avg = (btc_24 + eth_24) / 2.0
-
-        if avg > 2:
-            title = "🟢 Market Insight"
-            color = GREEN
-            lines = [
-                "🧠 السوق العام إيجابي اليوم",
-                "🌤️ بيتكوين وإيثيريوم داعمين الحركة",
-                "🚀 الألتات ممكن تاخد نفس"
-            ]
-            action = "راقب — دخول تدريجي"
-
-        elif avg < -2:
-            title = "🔴 Market Insight"
-            color = RED
-            lines = [
-                "🧠 السوق العام سلبي اليوم",
-                "🌧️ في ضغط على بيتكوين وإيثيريوم",
-                "⚠️ الألتات تحت تهديد"
-            ]
-            action = "خليك كاش — انتظار"
-
-        else:
-            title = "🟡 Market Insight"
-            color = YELLOW
-            lines = [
-                "🧠 السوق العام محايد",
-                "😐 ما في اتجاه قوي",
-                "👀 الأفضل مراقبة فقط"
-            ]
-            action = "مراقبة فقط"
-
-        desc = "\n".join(f"- {x}" for x in lines)
-        desc += f"\n\n👉 **Take Action:** {action}"
-
-        send_embed(title, desc, color)
-        last_market_insight_date = today
-
-    except Exception as e:
-        print("Insight error:", e, flush=True)
-
-# =========================================================
-# NEWS
-# =========================================================
-NEWS_FEEDS = [
-    {
-        "name": "Google News BTC",
-        "url": "https://news.google.com/rss/search?q=" + quote_plus("Bitcoin OR BTC when:1d") + "&hl=en-US&gl=US&ceid=US:en"
-    },
-    {
-        "name": "Google News ETH",
-        "url": "https://news.google.com/rss/search?q=" + quote_plus("Ethereum OR ETH when:1d") + "&hl=en-US&gl=US&ceid=US:en"
-    },
-    {
-        "name": "Google News Crypto Macro",
-        "url": "https://news.google.com/rss/search?q=" + quote_plus("crypto bank collapse fed sec etf exchange hack when:1d") + "&hl=en-US&gl=US&ceid=US:en"
-    },
-]
-
-BULLISH_KEYWORDS = {
-    "approval": 2, "approved": 2, "adoption": 2, "surge": 2, "rally": 2, "buy": 1,
-    "inflow": 2, "breakout": 2, "institutional": 1, "treasury": 1, "launch": 1,
-    "record high": 2, "all time high": 3, "etf": 1
-}
-
-BEARISH_KEYWORDS = {
-    "hack": 3, "breach": 3, "exploit": 3, "collapse": 3, "bankruptcy": 3, "liquidation": 2,
-    "ban": 3, "lawsuit": 2, "sec": 1, "dump": 2, "selloff": 2, "crash": 3, "recession": 2,
-    "fed": 1, "war": 2, "tariff": 2, "default": 3, "outflow": 2
-}
-
-BTC_CONTEXT = {"bitcoin", "btc", "microstrategy", "strategy", "etf"}
-ETH_CONTEXT = {"ethereum", "eth", "ether", "staking", "spot etf"}
-CRYPTO_CONTEXT = {"crypto", "exchange", "binance", "coinbase", "stablecoin", "market"}
-
-def fetch_rss_items(url):
-    try:
-        r = client.get(url)
-        r.raise_for_status()
-        root = ET.fromstring(r.text)
-
-        items = []
-        for item in root.findall(".//item"):
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            if title and link:
-                items.append({"title": title, "link": link, "pubDate": pub_date})
-        return items
-    except Exception as e:
-        print("RSS fetch error:", e, flush=True)
-        return []
-
-def headline_score_and_direction(title):
-    t = normalize_text(title)
-    bull = 0
-    bear = 0
-
-    for kw, score in BULLISH_KEYWORDS.items():
-        if kw in t:
-            bull += score
-
-    for kw, score in BEARISH_KEYWORDS.items():
-        if kw in t:
-            bear += score
-
-    context = []
-    if any(k in t for k in BTC_CONTEXT):
-        context.append("bitcoin")
-    if any(k in t for k in ETH_CONTEXT):
-        context.append("ethereum")
-    if any(k in t for k in CRYPTO_CONTEXT):
-        context.append("crypto")
-
-    total = max(bull, bear)
-    direction = "neutral"
-    if bull > bear:
-        direction = "bullish"
-    elif bear > bull:
-        direction = "bearish"
-
-    if "etf" in t:
-        total += 1
-    if "hack" in t or "collapse" in t or "bankruptcy" in t:
-        total += 2
-    if "fed" in t or "sec" in t:
-        total += 1
-
-    return total, direction, context
-
-def news_is_relevant(total_score, direction, context):
-    if total_score < MIN_NEWS_SCORE:
-        return False
-    if direction == "neutral":
-        return False
-    if not context:
-        return False
-
-    btc_move = abs(market_cache.get("btc_24h", 0.0))
-    eth_move = abs(market_cache.get("eth_24h", 0.0))
-    if total_score >= 7:
-        return True
-    if btc_move >= MIN_NEWS_PRICE_MOVE_FOR_ALERT or eth_move >= MIN_NEWS_PRICE_MOVE_FOR_ALERT:
-        return True
-    return False
-
-def dedupe_news_items(items):
-    unique = []
-    local_seen = set()
-
-    for item in items:
-        key = normalized_title_key(item["title"])
-        if not key or key in local_seen:
-            continue
-        local_seen.add(key)
-        unique.append(item)
-
-    return unique
-
-def collect_news_candidates():
-    items = []
-    for feed in NEWS_FEEDS:
-        items.extend(fetch_rss_items(feed["url"]))
-    return dedupe_news_items(items)
-
-def explain_news_simple(direction):
-    if direction == "bullish":
-        return [
-            "🧠 في خبر داعم للسوق",
-            "📈 الخبر ممكن يشرح سبب الطلوع",
-            "👀 راقب إذا السوق كمل تأكيد"
-        ]
-    if direction == "bearish":
-        return [
-            "🧠 في خبر ضاغط على السوق",
-            "📉 الخبر ممكن يشرح سبب الهبوط",
-            "⚠️ انتبه من الذعر والمطاردة"
-        ]
-    return [
-        "🧠 في خبر مهم",
-        "👀 راقب التفاعل",
-    ]
-
-def pick_best_news_event():
-    cleanup_seen_news()
-    candidates = collect_news_candidates()
-
-    scored = []
-    for item in candidates:
-        title = item["title"]
-        key = normalized_title_key(title)
-        total_score, direction, context = headline_score_and_direction(title)
-
-        if not news_is_relevant(total_score, direction, context):
-            continue
-
-        group_key = normalized_group_key(title)
-
-        if key in seen_news_titles:
-            continue
-        if group_key in seen_news_groups and (time.time() - seen_news_groups[group_key]) < (QUIET_HOURS_BETWEEN_SAME_NEWS * 3600):
-            continue
-
-        score = total_score
-        if direction == "bullish" and (market_cache.get("btc_24h", 0) > 0 or market_cache.get("eth_24h", 0) > 0):
-            score += 1
-        if direction == "bearish" and (market_cache.get("btc_24h", 0) < 0 or market_cache.get("eth_24h", 0) < 0):
-            score += 1
-
-        scored.append((score, item, direction, context, group_key, key))
-
-    if not scored:
-        return None
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0]
-
-def monitor_major_news():
-    global last_news_alert_time
-
-    try:
-        if not can_send_again(last_news_alert_time, NEWS_ALERT_COOLDOWN_SECONDS):
-            return
-
-        best = pick_best_news_event()
-        if not best:
-            return
-
-        score, item, direction, context, group_key, key = best
-        title_clean = strip_source_suffix(item["title"])
-
-        if direction == "bullish":
-            color = GREEN
-            header = "🟢 Major Market News"
-            action = "راقب الزخم — لا تطارد بدون تأكيد"
-        else:
-            color = RED
-            header = "🔴 Major Market News"
-            action = "خفف الاندفاع — راقب السيولة والدعم"
-
-        lines = explain_news_simple(direction)
-        lines.append(f"📰 {title_clean}")
-
-        desc = "\n".join(f"- {x}" for x in lines[:4])
-        desc += f"\n\n👉 **Take Action:** {action}"
-
-        send_embed(header, desc, color, url=item["link"])
-
-        seen_news_titles[key] = time.time()
-        seen_news_groups[group_key] = time.time()
-        last_news_alert_time = time.time()
-
-    except Exception as e:
-        print("News monitor error:", e, flush=True)
+    last_macro_signal = bias
+    last_macro_alert_time = time.time()
 
 # =========================================================
 # MAIN LOOP
 # =========================================================
 def run_bot():
-    print("PulseChain Rotation Agent SIMPLE PRO started...", flush=True)
+    print("PulseChain Rotation Agent PRO started...", flush=True)
+
     while True:
         try:
-            refresh_macro_market()
+            refresh_macro()
             monitor_tokens()
-            monitor_richard_heart()
-            daily_richard_heart_update()
-            monitor_btc_eth()
-            daily_market_insight()
-            monitor_major_news()
+            monitor_rotation()
+            monitor_macro()
             print("Loop completed successfully", flush=True)
         except Exception as e:
             print("Main loop error:", e, flush=True)
