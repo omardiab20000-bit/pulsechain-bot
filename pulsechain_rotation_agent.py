@@ -1,789 +1,359 @@
-import os
 import time
+from datetime import datetime, timezone
 import httpx
-from collections import defaultdict, deque
 
-DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+# =========================
+# Discord Webhook
+# =========================
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
 
+client = httpx.Client(timeout=20.0)
 
-class PulsechainRotationAgent:
-    def __init__(self):
-        self.client = httpx.AsyncClient(timeout=30.0)
+# =========================
+# State
+# =========================
+last_richard_status = None
+last_richard_daily_date = None
+last_market_insight_date = None
+last_btc_eth_signals = {"bitcoin": None, "ethereum": None}
+last_token_signals = {"PLS": None, "PLSX": None, "PROVEX": None}
 
-        self.WATCH_TOKENS = {
-            "PLS": "0xa1077a294dde1b09bb078844df40758a5d0f9a27",
-            "PLSX": "0x95b303987a60c71504d99aa1b13b4da07b0790ab",
-            "PROVEX": "0xf6f8db0aba00007681f8faf16a0fda1c9b030b11",
-        }
+# =========================
+# Token Config
+# IMPORTANT:
+# إذا عندك addresses أدق من هدول، بدّلهم لاحقاً
+# =========================
+TOKENS = [
+    {"symbol": "PLS", "search": "PLS pulsechain"},
+    {"symbol": "PLSX", "search": "PLSX pulsechain"},
+    {"symbol": "PROVEX", "search": "PROVEX pulsechain"},
+]
 
-        self.SYMBOL_AR = {
-            "PLS": "عملة بولس",
-            "PLSX": "عملة بولس إكس",
-            "PROVEX": "عملة بروفكس",
-        }
+# =========================
+# Helpers
+# =========================
+def send(msg: str):
+    try:
+        client.post(DISCORD_WEBHOOK, json={"content": msg})
+    except Exception as e:
+        print("Webhook send error:", e)
 
-        self.webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+def fmt_pct(v):
+    sign = "+" if v > 0 else ""
+    return f"{sign}{v:.2f}%"
 
-        self.FAST_SCAN_SECONDS = int(os.getenv("FAST_SCAN_SECONDS", "300"))
-        self.SUMMARY_SECONDS = int(os.getenv("SUMMARY_SECONDS", "14400"))
-        self.ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "1800"))
+def fmt_money(v):
+    try:
+        v = float(v)
+    except Exception:
+        return "$0"
+    if v >= 1_000_000_000:
+        return f"${v/1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.2f}K"
+    return f"${v:.2f}"
 
-        self.STABLE_SYMBOLS = {"USDC", "USDT", "DAI"}
+# =========================
+# DexScreener token fetch
+# =========================
+def fetch_token_market(search_term: str):
+    try:
+        url = "https://api.dexscreener.com/latest/dex/search"
+        r = client.get(url, params={"q": search_term})
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs", [])
 
-        self.history = defaultdict(lambda: deque(maxlen=24))
-        self.last_alert_time = {}
-        self.last_summary_time = 0.0
-
-    # ---------------- FETCH ----------------
-
-    async def fetch_token_pairs(self, address):
-        res = await self.client.get(DEX_URL.format(address))
-        res.raise_for_status()
-        data = res.json()
-        return data.get("pairs", [])
-
-    def choose_primary_pair(self, pairs):
-        pulse_pairs = [p for p in pairs if p.get("chainId") == "pulsechain"]
-        if not pulse_pairs:
+        if not pairs:
             return None
 
-        return max(
-            pulse_pairs,
-            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
-        )
-
-    # ---------------- DATA HELPERS ----------------
-
-    def append_history(self, symbol, pair):
-        self.history[symbol].append(pair)
-
-    def get_pair(self, symbol):
-        return self.history[symbol][-1] if self.history[symbol] else None
-
-    def liquidity_usd(self, pair):
-        return float((pair.get("liquidity") or {}).get("usd") or 0)
-
-    def volume_24h(self, pair):
-        return float((pair.get("volume") or {}).get("h24") or 0)
-
-    def volume_liq(self, pair):
-        liq = self.liquidity_usd(pair)
-        vol = self.volume_24h(pair)
-        return vol / liq if liq > 0 else 0.0
-
-    def pressure(self, pair):
-        txns = pair.get("txns") or {}
-        h1 = txns.get("h1") or {}
-        buys = float(h1.get("buys") or 0)
-        sells = float(h1.get("sells") or 0)
-
-        if sells == 0:
-            return buys if buys > 0 else 1.0
-        return buys / sells
-
-    def price_change_1h(self, pair):
-        return float((pair.get("priceChange") or {}).get("h1") or 0)
-
-    def liquidity_growth_pct(self, symbol):
-        hist = list(self.history[symbol])
-        if len(hist) < 2:
-            return 0.0
-
-        first = float((hist[0].get("liquidity") or {}).get("usd") or 0)
-        last = float((hist[-1].get("liquidity") or {}).get("usd") or 0)
-
-        if first <= 0:
-            return 0.0
-
-        return ((last - first) / first) * 100
-
-    def get_chart_link(self, pair):
-        pair_address = pair.get("pairAddress")
-        if pair_address:
-            return f"https://dexscreener.com/pulsechain/{pair_address}"
-        return "https://dexscreener.com"
-
-    def quote_symbol(self, pair):
-        quote = pair.get("quoteToken") or {}
-        return str(quote.get("symbol") or "").upper()
-
-    def is_stable_quoted(self, pair):
-        return self.quote_symbol(pair) in self.STABLE_SYMBOLS
-
-    # ---------------- FORMAT / VISUALS ----------------
-
-    def format_money(self, v):
-        v = float(v or 0)
-        if v >= 1_000_000_000:
-            return f"${v/1_000_000_000:.2f}B"
-        if v >= 1_000_000:
-            return f"${v/1_000_000:.2f}M"
-        if v >= 1_000:
-            return f"${v/1_000:.2f}K"
-        return f"${v:.2f}"
-
-    def rank_badge(self, rank):
-        badges = {1: "🥇", 2: "🥈", 3: "🥉"}
-        return badges.get(rank, "📍")
-
-    def symbol_emoji(self, symbol):
-        mapping = {
-            "PLS": "🔴",
-            "PLSX": "🟣",
-            "PROVEX": "🔵",
-        }
-        return mapping.get(symbol, "🪙")
-
-    def pressure_emoji(self, pressure):
-        if pressure >= 2:
-            return "🔥"
-        if pressure >= 1.2:
-            return "🟢"
-        if pressure >= 0.9:
-            return "🟡"
-        return "🔻"
-
-    def volliq_emoji(self, vol_liq):
-        if vol_liq >= 1.5:
-            return "🚀"
-        if vol_liq >= 0.8:
-            return "📈"
-        if vol_liq >= 0.3:
-            return "📊"
-        return "🧊"
-
-    def liq_emoji(self, liq_growth):
-        if liq_growth >= 5:
-            return "🌊"
-        if liq_growth >= 1:
-            return "💧"
-        if liq_growth > -1:
-            return "🪙"
-        return "🥀"
-
-    def flow_score_emoji(self, score):
-        if score >= 8:
-            return "🔥"
-        if score >= 6:
-            return "🟢"
-        if score >= 4:
-            return "🟡"
-        return "🔻"
-
-    def flow_score_label_ar(self, score):
-        if score >= 8:
-            return "قوي جداً"
-        if score >= 6:
-            return "قوي"
-        if score >= 4:
-            return "متوسط"
-        return "ضعيف"
-
-    def symbol_name_ar(self, symbol):
-        return self.SYMBOL_AR.get(symbol, f"عملة {symbol}")
-
-    def signal_title_clean(self, signal):
-        return f"{signal['symbol']} Coin"
-
-    def market_bias(self, pressure, price_1h, flow_score):
-        if flow_score >= 7 and pressure >= 1.2 and price_1h >= 0:
-            return "Bullish"
-        if flow_score <= 4 and pressure < 1:
-            return "Bearish"
-        return "Neutral"
-
-    def market_bias_ar(self, bias):
-        mapping = {
-            "Bullish": "صاعد",
-            "Bearish": "هابط",
-            "Neutral": "حيادي",
-        }
-        return mapping.get(bias, "حيادي")
-
-    def market_bias_emoji(self, bias):
-        mapping = {
-            "Bullish": "🔥",
-            "Bearish": "🔻",
-            "Neutral": "🟡",
-        }
-        return mapping.get(bias, "🟡")
-
-    def ratio_buy_score(self, pair):
-        if not pair:
-            return 0
-
-        vol_liq = self.volume_liq(pair)
-        pressure = self.pressure(pair)
-        price_1h = self.price_change_1h(pair)
-
-        score = 0.0
-
-        if vol_liq >= 1.5:
-            score += 4.0
-        elif vol_liq >= 1.0:
-            score += 3.0
-        elif vol_liq >= 0.7:
-            score += 2.0
-        elif vol_liq >= 0.3:
-            score += 1.0
-
-        if pressure >= 2.0:
-            score += 4.0
-        elif pressure >= 1.5:
-            score += 3.0
-        elif pressure >= 1.2:
-            score += 2.0
-        elif pressure >= 1.0:
-            score += 1.0
-
-        if price_1h >= 3:
-            score += 2.0
-        elif price_1h >= 0:
-            score += 1.0
-        elif price_1h < -2:
-            score -= 1.0
-
-        return max(0, min(10, round(score)))
-
-    def ratio_buy_label_ar(self, score):
-        if score >= 8:
-            return "فرصة شراء قوية"
-        if score >= 6:
-            return "مراقبة شراء"
-        if score >= 4:
-            return "محايد"
-        return "ضعيف للشراء"
-
-    def ratio_buy_emoji(self, score):
-        if score >= 8:
-            return "🟢"
-        if score >= 6:
-            return "🟡"
-        return "🔻"
-
-    def ratio_buy_read_ar(self, score, symbol):
-        if score >= 8:
-            return f"النسبة ممتازة على {symbol} والشراء يبدو مبرراً إذا جاء تأكيد."
-        if score >= 6:
-            return f"في بوادر فرصة على {symbol} لكن الأفضل انتظار تأكيد إضافي."
-        if score >= 4:
-            return f"الوضع على {symbol} متوسط — ليس سيئاً لكن ليس دخولاً واضحاً بعد."
-        return f"نسبة الشراء على {symbol} ضعيفة حالياً والأفضل عدم الاستعجال."
-
-    def one_liner_market_read_ar(self, row):
-        symbol = row["symbol"]
-        pressure = row["pressure"]
-        vol_liq = row["vol_liq"]
-        price_1h = row["price_1h"]
-        liq_growth = row["liq_growth"]
-
-        if pressure >= 2 and vol_liq >= 1:
-            return f"شراء واضح على {symbol} والزخم صاحي."
-        if pressure >= 1.2 and liq_growth > 0:
-            return f"في تجميع محترم على {symbol} والسيولة تتحسن."
-        if pressure < 1 and price_1h < 0:
-            return f"{symbol} عليه ضغط بيع والسوق حذر."
-        if vol_liq < 0.25:
-            return f"الحركة على {symbol} هادئة والسيولة بطيئة."
-        return f"{symbol} تحت المراقبة، لسه الإشارة مو محسومة."
-
-    # ---------------- FLOW ENGINE ----------------
-
-    def flow_score(self, symbol):
-        pair = self.get_pair(symbol)
-        if not pair:
-            return 0
-
-        pressure = self.pressure(pair)
-        price_1h = self.price_change_1h(pair)
-        vol_liq = self.volume_liq(pair)
-        liq_growth = self.liquidity_growth_pct(symbol)
-
-        score = 0.0
-
-        if pressure >= 2.0:
-            score += 3.0
-        elif pressure >= 1.5:
-            score += 2.4
-        elif pressure >= 1.2:
-            score += 1.8
-        elif pressure >= 1.0:
-            score += 1.0
-        else:
-            score += 0.2
-
-        if vol_liq >= 1.5:
-            score += 3.0
-        elif vol_liq >= 1.0:
-            score += 2.4
-        elif vol_liq >= 0.7:
-            score += 1.8
-        elif vol_liq >= 0.3:
-            score += 1.0
-        else:
-            score += 0.2
-
-        if price_1h >= 6:
-            score += 2.0
-        elif price_1h >= 2:
-            score += 1.5
-        elif price_1h >= 0:
-            score += 1.0
-        elif price_1h > -2:
-            score += 0.5
-        else:
-            score += 0.1
-
-        if liq_growth >= 5:
-            score += 2.0
-        elif liq_growth >= 2:
-            score += 1.5
-        elif liq_growth >= 0:
-            score += 1.0
-        elif liq_growth > -2:
-            score += 0.5
-        else:
-            score += 0.1
-
-        return max(0, min(10, round(score)))
-
-    def flow_read(self, symbol):
-        pair = self.get_pair(symbol)
-        if not pair:
-            return "Flow unclear"
-
-        pressure = self.pressure(pair)
-        price_1h = self.price_change_1h(pair)
-        vol_liq = self.volume_liq(pair)
-
-        pls = self.get_pair("PLS")
-        plsx = self.get_pair("PLSX")
-
-        pls_score = None
-        plsx_score = None
-
-        if pls:
-            pls_score = (
-                self.volume_liq(pls) * 30
-                + max(self.pressure(pls) - 1, 0) * 25
-                + max(self.price_change_1h(pls), 0) * 3
-                + max(self.liquidity_growth_pct("PLS"), 0) * 2
-            )
-
-        if plsx:
-            plsx_score = (
-                self.volume_liq(plsx) * 30
-                + max(self.pressure(plsx) - 1, 0) * 25
-                + max(self.price_change_1h(plsx), 0) * 3
-                + max(self.liquidity_growth_pct("PLSX"), 0) * 2
-            )
-
-        if symbol == "PLS" and pls_score is not None and plsx_score is not None:
-            if pls_score > plsx_score * 1.15:
-                return "Flow favors PLS over PLSX"
-            if plsx_score > pls_score * 1.15:
-                return "Flow still stronger in PLSX"
-
-        if symbol == "PLSX" and pls_score is not None and plsx_score is not None:
-            if plsx_score > pls_score * 1.15:
-                return "Flow favors PLSX over PLS"
-            if pls_score > plsx_score * 1.15:
-                return "Flow still stronger in PLS"
-
-        if self.is_stable_quoted(pair):
-            if pressure < 1 and price_1h < 0:
-                return "Defensive flow / stable pair pressure increasing"
-            if pressure > 1.2 and vol_liq > 1:
-                return f"Risk-on flow building into {symbol}"
-
-        if pressure >= 1.4 and vol_liq >= 1 and price_1h >= 0:
-            return f"Strong inflow into {symbol}"
-
-        if pressure >= 1.15 and price_1h > -1:
-            return f"Flow building into {symbol}"
-
-        if pressure < 1 and price_1h < 0:
-            return "Defensive tone / sellers active"
-
-        return "Flow mixed / not decisive yet"
-
-    def flow_read_ar(self, symbol):
-        flow = self.flow_read(symbol)
-
-        mapping = {
-            "Flow favors PLS over PLSX": "السيولة تميل بوضوح نحو PLS أكثر من PLSX",
-            "Flow still stronger in PLSX": "السيولة ما تزال أقوى في PLSX",
-            "Flow favors PLSX over PLS": "السيولة تميل بوضوح نحو PLSX أكثر من PLS",
-            "Flow still stronger in PLS": "السيولة ما تزال أقوى في PLS",
-            "Defensive flow / stable pair pressure increasing": "تدفق دفاعي — الضغط يتجه نحو أزواج الستيبِل",
-            "Risk-on flow building into PLS": "شهية المخاطرة ترتفع والسيولة تبدأ تدخل إلى PLS",
-            "Risk-on flow building into PLSX": "شهية المخاطرة ترتفع والسيولة تبدأ تدخل إلى PLSX",
-            "Risk-on flow building into PROVEX": "شهية المخاطرة ترتفع والسيولة تبدأ تدخل إلى PROVEX",
-            "Strong inflow into PLS": "في دخول قوي وواضح على PLS",
-            "Strong inflow into PLSX": "في دخول قوي وواضح على PLSX",
-            "Strong inflow into PROVEX": "في دخول قوي وواضح على PROVEX",
-            "Flow building into PLS": "السيولة تتجمع تدريجياً على PLS",
-            "Flow building into PLSX": "السيولة تتجمع تدريجياً على PLSX",
-            "Flow building into PROVEX": "السيولة تتجمع تدريجياً على PROVEX",
-            "Defensive tone / sellers active": "السوق دفاعي حالياً والبائعين نشطين",
-            "Flow mixed / not decisive yet": "التدفق مختلط ولسه الاتجاه غير محسوم",
-            "Flow unclear": "التدفق غير واضح حالياً",
+        pulse_pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "pulsechain"]
+        if pulse_pairs:
+            pairs = pulse_pairs
+
+        def score(p):
+            liq = float((p.get("liquidity") or {}).get("usd") or 0)
+            vol = float((p.get("volume") or {}).get("h24") or 0)
+            buys = float((((p.get("txns") or {}).get("h1") or {}).get("buys")) or 0)
+            sells = float((((p.get("txns") or {}).get("h1") or {}).get("sells")) or 0)
+            return liq * 0.6 + vol * 0.3 + (buys + sells) * 50
+
+        best = sorted(pairs, key=score, reverse=True)[0]
+
+        txns_h1 = (best.get("txns") or {}).get("h1") or {}
+        liquidity = best.get("liquidity") or {}
+        volume = best.get("volume") or {}
+        price_change = best.get("priceChange") or {}
+
+        buys_h1 = float(txns_h1.get("buys") or 0)
+        sells_h1 = float(txns_h1.get("sells") or 0)
+        ratio_h1 = buys_h1 / max(1.0, sells_h1)
+
+        liq_usd = float(liquidity.get("usd") or 0)
+        vol_h1 = float(volume.get("h1") or 0)
+
+        h1_change = float(price_change.get("h1") or 0)
+        h6_change = float(price_change.get("h6") or 0)
+        h24_change = float(price_change.get("h24") or 0)
+
+        flow_score = 0
+        flow_score += min(4, ratio_h1) * 1.8
+        flow_score += 1.5 if vol_h1 > 0 and liq_usd > 0 and (vol_h1 / max(liq_usd, 1)) > 0.04 else 0
+        flow_score += 1.0 if h1_change > -4 else 0
+        flow_score = min(flow_score, 10)
+
+        return {
+            "symbol": best.get("baseToken", {}).get("symbol") or search_term.split()[0],
+            "liq_usd": liq_usd,
+            "vol_h1": vol_h1,
+            "buys_h1": buys_h1,
+            "sells_h1": sells_h1,
+            "ratio_h1": ratio_h1,
+            "h1_change": h1_change,
+            "h6_change": h6_change,
+            "h24_change": h24_change,
+            "flow_score": flow_score,
         }
 
-        return mapping.get(flow, "قراءة التدفق غير واضحة حالياً")
-
-    # ---------------- ARABIC TRADER TALK ----------------
-
-    def trader_talk_ar(self, signal):
-        t = signal["type"]
-        p = signal["pressure"]
-        h = signal["price_1h"]
-        lg = signal["liq_growth"]
-        fscore = signal.get("flow_score", 0)
-        ratio_score = signal.get("ratio_buy_score", 0)
-
-        if t == "SNIPER":
-            if signal["grade"] == "A+":
-                return f"🔥 فرصة قوية — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10 والزخم واضح."
-            if p >= 2:
-                return f"💥 شراء واضح من السوق — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
-            return f"✅ الاختراق تأكد — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
-
-        if t == "WATCH":
-            if p >= 1.8 and h < 0:
-                return f"👀 في تجميع محتمل — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
-            if lg > 2:
-                return f"💧 السيولة عم تدخل — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
-            return f"📊 راقبها عن قرب — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
-
-        if t == "EXTENDED":
-            return f"⚠️ انتبه — الحركة ممدودة حتى لو التدفق {fscore}/10، ونسبة الشراء الآن {ratio_score}/10."
-
-        if t == "BRAIN":
-            return signal.get("action_ar", f"🧠 في حركة مهمّة بالسوق — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10.")
-
-        return f"📈 راقب السوق — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
-
-    # ---------------- SIGNAL ENGINE ----------------
-
-    def build_signal(self, symbol):
-        pair = self.get_pair(symbol)
-        if not pair:
-            return None
-
-        try:
-            liquidity = self.liquidity_usd(pair)
-            volume = self.volume_24h(pair)
-            vol_liq = self.volume_liq(pair)
-            pressure = self.pressure(pair)
-            price_1h = self.price_change_1h(pair)
-            liq_growth = self.liquidity_growth_pct(symbol)
-            chart = self.get_chart_link(pair)
-            flow = self.flow_read(symbol)
-            flow_score = self.flow_score(symbol)
-            ratio_buy_score = self.ratio_buy_score(pair)
-            bias = self.market_bias(pressure, price_1h, flow_score)
-        except Exception as e:
-            print(f"[{symbol}] data error: {e}", flush=True)
-            return None
-
-        if liquidity <= 0 or volume <= 0:
-            return None
-
-        if symbol in ("PLS", "PLSX") and liq_growth >= 4 and pressure >= 1.1 and vol_liq >= 0.7:
-            return {
-                "type": "BRAIN",
-                "symbol": symbol,
-                "color": 0x3498DB,
-                "title": "🧠 LIQUIDITY BUILDUP",
-                "grade": "Brain",
-                "note": "Liquidity is building on a core asset",
-                "note_ar": "السيولة عم تتجمع على أصل أساسي وقد تسبق حركة أكبر",
-                "flow": flow,
-                "flow_score": flow_score,
-                "ratio_buy_score": ratio_buy_score,
-                "bias": bias,
-                "action": "🎯 Track closely / market may be preparing a bigger move",
-                "action_ar": f"🧠 انتبه — السيولة عم تتجمع، التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
-                "chart": chart,
-                "liquidity": liquidity,
-                "volume": volume,
-                "vol_liq": vol_liq,
-                "pressure": pressure,
-                "price_1h": price_1h,
-                "liq_growth": liq_growth,
-            }
-
-        if price_1h >= 12 or vol_liq >= 3.5:
-            return {
-                "type": "EXTENDED",
-                "symbol": symbol,
-                "color": 0xE74C3C,
-                "title": "⚠️ EXTENDED MOVE",
-                "grade": "Late",
-                "note": "Move looks stretched — avoid chasing",
-                "note_ar": "الحركة ممدودة أكثر من اللازم — الأفضل عدم الملاحقة",
-                "flow": flow,
-                "flow_score": flow_score,
-                "ratio_buy_score": ratio_buy_score,
-                "bias": bias,
-                "action": "🎯 Wait for pullback / do not chase",
-                "action_ar": f"⚠️ خفف اندفاعك — التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
-                "chart": chart,
-                "liquidity": liquidity,
-                "volume": volume,
-                "vol_liq": vol_liq,
-                "pressure": pressure,
-                "price_1h": price_1h,
-                "liq_growth": liq_growth,
-            }
-
-        if (
-            vol_liq >= 1.3
-            and pressure >= 1.3
-            and price_1h >= 0.5
-            and liq_growth >= -1
-        ):
-            grade = "A+" if price_1h <= 6 and vol_liq <= 2.2 else "B"
-            return {
-                "type": "SNIPER",
-                "symbol": symbol,
-                "color": 0x2ECC71,
-                "title": "🚀 SNIPER ENTRY",
-                "grade": grade,
-                "note": "Breakout + volume expansion detected",
-                "note_ar": "اختراق مع توسع بالحجم — الزخم حاضر",
-                "flow": flow,
-                "flow_score": flow_score,
-                "ratio_buy_score": ratio_buy_score,
-                "bias": bias,
-                "action": "🎯 Momentum confirmed — consider entry",
-                "action_ar": f"🚀 الزخم متأكد — التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
-                "chart": chart,
-                "liquidity": liquidity,
-                "volume": volume,
-                "vol_liq": vol_liq,
-                "pressure": pressure,
-                "price_1h": price_1h,
-                "liq_growth": liq_growth,
-            }
-
-        if (
-            vol_liq >= 0.9
-            and pressure >= 1.15
-            and price_1h >= -1.0
-            and liq_growth >= -2
-        ):
-            return {
-                "type": "WATCH",
-                "symbol": symbol,
-                "color": 0xF1C40F,
-                "title": "👀 WATCH",
-                "grade": "Watch",
-                "note": "Flow is building, but breakout not fully confirmed yet",
-                "note_ar": "التدفق يتحسن، لكن الاختراق لم يتأكد بالكامل بعد",
-                "flow": flow,
-                "flow_score": flow_score,
-                "ratio_buy_score": ratio_buy_score,
-                "bias": bias,
-                "action": "🎯 Watch for confirmation / 1H strength",
-                "action_ar": f"👀 راقب التأكيد وقوة الساعة — التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
-                "chart": chart,
-                "liquidity": liquidity,
-                "volume": volume,
-                "vol_liq": vol_liq,
-                "pressure": pressure,
-                "price_1h": price_1h,
-                "liq_growth": liq_growth,
-            }
-
+    except Exception as e:
+        print("Dex fetch error:", search_term, e)
         return None
 
-    # ---------------- SUMMARY / LEADERBOARD ----------------
+# =========================
+# Token signal logic
+# =========================
+def classify_token_signal(m):
+    ratio = m["ratio_h1"]
+    flow = m["flow_score"]
+    h1 = m["h1_change"]
+    h6 = m["h6_change"]
 
-    def summary_due(self):
-        return time.time() - self.last_summary_time >= self.SUMMARY_SECONDS
+    # هبوط قوي + شراء واضح = فرصة شراء
+    if (h1 <= -8 or h6 <= -15) and ratio >= 1.4 and flow >= 6.5:
+        return "buy_now", "هبوط قوي مع شراء واضح من السوق", "شراء الآن"
 
-    def mark_summary_sent(self):
-        self.last_summary_time = time.time()
+    # قوة واضحة = عزز تدريجي
+    if flow >= 7 and ratio >= 1.35 and h1 <= 5:
+        return "strong", "سيولة وشراء واضح — في قوة بالسوق", "عزّز بشكل تدريجي"
 
-    def build_leaderboard_summary(self):
-        rows = []
+    # هبوط يحتاج مراقبة
+    if h1 <= -6 or h6 <= -10:
+        if ratio >= 1.1:
+            return "dip_watch", "هبوط واضح لكن في ناس عم تشتري", "راقب الارتداد — لا تستعجل"
+        return "risk", "ضغط بيع واضح وما في تأكيد شراء كافي", "لا دخول — انتبه"
 
-        for symbol in self.WATCH_TOKENS.keys():
-            pair = self.get_pair(symbol)
-            if not pair:
+    # حركة وتجميع
+    if flow >= 5.8 and ratio >= 1.15:
+        return "watch", "في حركة وتجميع يستحق المتابعة", "راقب — دخول تدريجي"
+
+    return "none", "الوضع محايد — ما في إشارة قوية", "خليك كاش — انتظار"
+
+def build_token_message(symbol, m, level, summary_ar, action_ar):
+    icon = {
+        "watch": "🟡",
+        "strong": "🟢",
+        "dip_watch": "🔻",
+        "buy_now": "🚨",
+        "risk": "🔴",
+    }.get(level, "⚪")
+
+    buy_power = min(10, m["ratio_h1"] * 4.2)
+
+    return (
+        f"{icon} **{symbol}**\n"
+        f"**الزبدة:** {summary_ar}\n"
+        f"**تدفق السيولة:** {m['flow_score']:.1f}/10\n"
+        f"**قوة الشراء:** {buy_power:.1f}/10\n"
+        f"**التغيّر 1س:** {fmt_pct(m['h1_change'])}\n"
+        f"**السيولة:** {fmt_money(m['liq_usd'])}\n"
+        f"👉 **Take Action:** {action_ar}"
+    )
+
+def monitor_tokens():
+    for token in TOKENS:
+        market = fetch_token_market(token["search"])
+        if not market:
+            continue
+
+        symbol = token["symbol"]
+        level, summary_ar, action_ar = classify_token_signal(market)
+
+        if level == "none":
+            continue
+
+        current_signal = f"{level}:{round(market['h1_change'],1)}:{round(market['ratio_h1'],2)}:{round(market['flow_score'],1)}"
+        if last_token_signals.get(symbol) == current_signal:
+            continue
+
+        msg = build_token_message(symbol, market, level, summary_ar, action_ar)
+        send(msg)
+        last_token_signals[symbol] = current_signal
+
+# =========================
+# Richard Heart monitor
+# =========================
+def monitor_richard_heart():
+    global last_richard_status
+    try:
+        r = client.get("https://richardheart.com/", follow_redirects=True)
+        online = 200 <= r.status_code < 400
+    except Exception:
+        online = False
+
+    if last_richard_status is None:
+        last_richard_status = online
+        return
+
+    if online != last_richard_status:
+        if online:
+            send(
+                "🟢 **RichardHeart.com**\n"
+                "**الحالة:** Online\n"
+                "👉 **الزبدة:** الموقع رجع — راقب لاحتمال عودة النشاط أو بث"
+            )
+        else:
+            send(
+                "🔴 **RichardHeart.com**\n"
+                "**الحالة:** Offline\n"
+                "👉 **الزبدة:** الموقع مطفي — لا تغيير حالياً"
+            )
+        last_richard_status = online
+
+def daily_richard_heart_update():
+    global last_richard_daily_date
+    today = datetime.now(timezone.utc).date()
+
+    if last_richard_daily_date == today:
+        return
+
+    try:
+        r = client.get("https://richardheart.com/", follow_redirects=True)
+        online = 200 <= r.status_code < 400
+    except Exception:
+        online = False
+
+    if online:
+        send(
+            "🟢 **RichardHeart.com — Daily Update**\n"
+            "**الحالة:** Online\n"
+            "👉 **الزبدة:** الموقع شغال اليوم — راقب لأي نشاط أو بث"
+        )
+    else:
+        send(
+            "🔴 **RichardHeart.com — Daily Update**\n"
+            "**الحالة:** Offline\n"
+            "👉 **الزبدة:** الموقع ما زال متوقف اليوم"
+        )
+
+    last_richard_daily_date = today
+
+# =========================
+# BTC / ETH monitor
+# =========================
+def monitor_btc_eth():
+    global last_btc_eth_signals
+
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "ids": "bitcoin,ethereum",
+            "price_change_percentage": "1h,24h"
+        }
+        data = client.get(url, params=params).json()
+
+        for coin in data:
+            coin_id = coin["id"]
+            name = coin["name"]
+            ch1 = coin.get("price_change_percentage_1h_in_currency") or 0
+            ch24 = coin.get("price_change_percentage_24h") or 0
+
+            signal = None
+            if ch1 >= 3 or ch24 >= 5:
+                signal = "up"
+            elif ch1 <= -3 or ch24 <= -5:
+                signal = "down"
+
+            if not signal:
                 continue
 
-            liq = self.liquidity_usd(pair)
-            vol = self.volume_24h(pair)
-            vol_liq = self.volume_liq(pair)
-            pressure = self.pressure(pair)
-            price_1h = self.price_change_1h(pair)
-            liq_growth = self.liquidity_growth_pct(symbol)
-            flow_score = self.flow_score(symbol)
-            ratio_buy_score = self.ratio_buy_score(pair)
-            bias = self.market_bias(pressure, price_1h, flow_score)
+            if last_btc_eth_signals.get(coin_id) == signal:
+                continue
 
-            score = (
-                (vol_liq * 30)
-                + (max(pressure - 1, 0) * 20)
-                + (max(price_1h, 0) * 3)
-                + (max(liq_growth, 0) * 2)
-            )
+            if signal == "up":
+                send(
+                    f"🚨 **{name}**\n"
+                    f"**الزبدة:** صعود قوي {ch1:.2f}% خلال 1س / {ch24:.2f}% خلال 24س\n"
+                    f"👉 **Take Action:** راقب الزخم — لا تطارد"
+                )
+            else:
+                send(
+                    f"🔻 **{name}**\n"
+                    f"**الزبدة:** هبوط واضح {ch1:.2f}% خلال 1س / {ch24:.2f}% خلال 24س\n"
+                    f"👉 **Take Action:** راقب الدعم — لا تستعجل"
+                )
 
-            rows.append({
-                "symbol": symbol,
-                "score": score,
-                "liq": liq,
-                "vol": vol,
-                "vol_liq": vol_liq,
-                "pressure": pressure,
-                "price_1h": price_1h,
-                "liq_growth": liq_growth,
-                "flow": self.flow_read(symbol),
-                "flow_ar": self.flow_read_ar(symbol),
-                "flow_score": flow_score,
-                "ratio_buy_score": ratio_buy_score,
-                "bias": bias,
-            })
+            last_btc_eth_signals[coin_id] = signal
 
-        if not rows:
-            return None
+    except Exception as e:
+        print("BTC/ETH error:", e)
 
-        rows.sort(key=lambda x: x["score"], reverse=True)
-        top = rows[:3]
+# =========================
+# Daily Market Insight
+# =========================
+def daily_market_insight():
+    global last_market_insight_date
+    today = datetime.now(timezone.utc).date()
 
-        embed = {
-            "title": "🏆 4H Leaderboard / Market Pulse",
-            "color": 0x9B59B6,
-            "description": "Top rotation / liquidity activity across PLS, PLSX, PROVEX",
-            "fields": [],
-        }
+    if last_market_insight_date == today:
+        return
 
-        separator = "━━━━━━━━━━━━━━━━━━━━━━"
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {"vs_currency": "usd", "ids": "bitcoin,ethereum"}
+        data = client.get(url, params=params).json()
 
-        for i, row in enumerate(top, start=1):
-            rank = self.rank_badge(i)
-            symbol_icon = self.symbol_emoji(row["symbol"])
-            pressure_icon = self.pressure_emoji(row["pressure"])
-            vol_icon = self.volliq_emoji(row["vol_liq"])
-            liq_icon = self.liq_emoji(row["liq_growth"])
-            quick_read_ar = self.one_liner_market_read_ar(row)
-            flow_score = row["flow_score"]
-            flow_score_icon = self.flow_score_emoji(flow_score)
-            flow_score_label = self.flow_score_label_ar(flow_score)
-            ratio_buy_score = row["ratio_buy_score"]
-            ratio_buy_icon = self.ratio_buy_emoji(ratio_buy_score)
-            ratio_buy_label = self.ratio_buy_label_ar(ratio_buy_score)
-            ratio_buy_read = self.ratio_buy_read_ar(ratio_buy_score, row["symbol"])
-            bias = row["bias"]
-            bias_icon = self.market_bias_emoji(bias)
-            bias_ar = self.market_bias_ar(bias)
+        btc = data[0]
+        eth = data[1]
 
-            value = (
-                f"{liq_icon} **Liquidity / السيولة**: {self.format_money(row['liq'])} ({row['liq_growth']:+.1f}%)\n"
-                f"{vol_icon} **Vol/Liq / الحجم إلى السيولة**: {row['vol_liq']:.2f}\n"
-                f"{pressure_icon} **Pressure / القوة**: {row['pressure']:.2f}\n"
-                f"⏱️ **1H Move / حركة الساعة**: {row['price_1h']:+.2f}%\n"
-                f"{flow_score_icon} **Flow Score / تقييم التدفق**: {flow_score}/10 ({flow_score_label})\n"
-                f"{bias_icon} **Bias / التوجه**: {bias} / {bias_ar}\n"
-                f"{ratio_buy_icon} **Buy Ratio / نسبة الشراء**: {ratio_buy_score}/10 ({ratio_buy_label})\n"
-                f"🧭 **Flow / تدفق السيولة**: {row['flow']}\n"
-                f"🇸🇦 **التدفق**: {row['flow_ar']}\n"
-                f"📌 **الخلاصة**: {quick_read_ar}\n"
-                f"🛒 **قراءة الشراء**: {ratio_buy_read}\n"
-                f"{separator}"
-            )
+        avg = ((btc.get("price_change_percentage_24h") or 0) + (eth.get("price_change_percentage_24h") or 0)) / 2
 
-            embed["fields"].append({
-                "name": f"{rank} {symbol_icon} {row['symbol']} — {self.symbol_name_ar(row['symbol'])}",
-                "value": value,
-                "inline": False
-            })
-
-        embed["fields"].append({
-            "name": "🧠 قراءة السوق",
-            "value": (
-                "إذا شفت تقييم التدفق عالي مع ضغط شراء وسيولة تتحسن، غالباً في حركة عم تنبني فعلياً. "
-                "أما Buy Ratio فهو طبقة قرار إضافية: كلما ارتفع، صارت فكرة الشراء أقوى. إذا كان منخفض، خليك مراقب أكثر من كونك مندفع."
-            ),
-            "inline": False
-        })
-
-        return {"embeds": [embed]}
-
-    # ---------------- ALERT CONTROL ----------------
-
-    def should_send_signal(self, symbol):
-        now = time.time()
-        last = self.last_alert_time.get(symbol, 0)
-        return now - last > self.ALERT_COOLDOWN_SECONDS
-
-    def mark_signal_sent(self, symbol):
-        self.last_alert_time[symbol] = time.time()
-
-    # ---------------- EMBED ----------------
-
-    def build_embed_payload(self, signal):
-        action_ar = self.trader_talk_ar(signal)
-        fscore = signal.get("flow_score", 0)
-        fscore_icon = self.flow_score_emoji(fscore)
-        fscore_label = self.flow_score_label_ar(fscore)
-        symbol_ar = self.symbol_name_ar(signal["symbol"])
-        ratio_buy_score = signal.get("ratio_buy_score", 0)
-        ratio_buy_icon = self.ratio_buy_emoji(ratio_buy_score)
-        ratio_buy_label = self.ratio_buy_label_ar(ratio_buy_score)
-        ratio_buy_read = self.ratio_buy_read_ar(ratio_buy_score, signal["symbol"])
-        bias = signal.get("bias", self.market_bias(signal["pressure"], signal["price_1h"], fscore))
-        bias_icon = self.market_bias_emoji(bias)
-        bias_ar = self.market_bias_ar(bias)
-
-        embed = {
-            "title": self.signal_title_clean(signal),
-            "description": f"{symbol_ar}",
-            "color": signal["color"],
-            "fields": [
-                {"name": "🪙 Coin / العملة", "value": f"{signal['symbol']} — {symbol_ar}", "inline": False},
-                {"name": "🏷️ Grade / التصنيف", "value": signal["grade"], "inline": True},
-                {"name": "💧 Liquidity / السيولة", "value": self.format_money(signal["liquidity"]), "inline": True},
-                {"name": "📊 Vol/Liq / الحجم إلى السيولة", "value": f"{signal['vol_liq']:.2f}", "inline": True},
-                {"name": "💰 Volume / الحجم", "value": self.format_money(signal["volume"]), "inline": True},
-                {"name": "⚖️ Pressure / القوة", "value": f"{signal['pressure']:.2f}", "inline": True},
-                {"name": "📈 1H / حركة الساعة", "value": f"{signal['price_1h']:+.2f}%", "inline": True},
-                {"name": "💧 Liquidity Δ / تغير السيولة", "value": f"{signal['liq_growth']:+.1f}%", "inline": True},
-                {"name": f"{fscore_icon} Flow Score / تقييم التدفق", "value": f"{fscore}/10 ({fscore_label})", "inline": True},
-                {"name": f"{bias_icon} Bias / التوجه", "value": f"{bias} / {bias_ar}", "inline": True},
-                {"name": f"{ratio_buy_icon} Buy Ratio / نسبة الشراء", "value": f"{ratio_buy_score}/10 ({ratio_buy_label})", "inline": True},
-                {"name": "🧭 Flow / تدفق السيولة", "value": f"{signal['flow']}\n{self.flow_read_ar(signal['symbol'])}", "inline": False},
-                {"name": "🧠 Insight / نظرة", "value": f"{signal['note']}\n{signal.get('note_ar', '')}\n\u200b\n\u200b", "inline": False},
-                {"name": "🛒 Buy Read / قراءة الشراء", "value": ratio_buy_read, "inline": False},
-                {"name": "🎯 Action / الإجراء", "value": f"{signal['action']}\n{action_ar}", "inline": False},
-                {"name": "🔗 Chart / الشارت", "value": signal["chart"], "inline": False},
-            ],
-        }
-
-        return {"embeds": [embed]}
-
-    async def send_discord_text(self, text):
-        if not self.webhook:
-            print("DISCORD_WEBHOOK_URL missing", flush=True)
-            return
-
-        res = await self.client.post(self.webhook, json={"content": text})
-        print("Discord status:", res.status_code, flush=True)
-
-    async def send_discord(self, signal_or_payload):
-        if not self.webhook:
-            print("DISCORD_WEBHOOK_URL missing", flush=True)
-            return
-
-        if isinstance(signal_or_payload, dict) and "embeds" in signal_or_payload:
-            payload = signal_or_payload
-        elif isinstance(signal_or_payload, dict):
-            payload = self.build_embed_payload(signal_or_payload)
+        if avg > 2:
+            state = "صعود"
+            action = "راقب — دخول تدريجي"
+        elif avg < -2:
+            state = "هبوط"
+            action = "خليك كاش — انتظار"
         else:
-            payload = {"content": str(signal_or_payload)}
+            state = "حيادي"
+            action = "مراقبة فقط"
 
-        res = await self.client.post(self.webhook, json=payload)
-        print("Discord status:", res.status_code, flush=True)
+        send(
+            f"📊 **Market Insight**\n"
+            f"**اليوم:** السوق بحالة {state}\n"
+            f"👉 **الزبدة:** نظرة عامة يومية بسيطة على BTC و ETH\n"
+            f"👉 **Take Action:** {action}"
+        )
+
+        last_market_insight_date = today
+
+    except Exception as e:
+        print("Insight error:", e)
+
+# =========================
+# Main bot loop
+# =========================
+def run_bot():
+    while True:
+        try:
+            monitor_tokens()
+            monitor_richard_heart()
+            daily_richard_heart_update()
+            monitor_btc_eth()
+            daily_market_insight()
+        except Exception as e:
+            print("Main loop error:", e)
+
+        time.sleep(300)
