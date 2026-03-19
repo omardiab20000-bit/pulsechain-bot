@@ -2,7 +2,7 @@ import time
 from datetime import datetime, timezone
 import httpx
 
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
+DISCORD_WEBHOOK = "YOUR_NEW_WEBHOOK_HERE"
 
 client = httpx.Client(timeout=20.0, follow_redirects=True)
 
@@ -14,19 +14,30 @@ last_richard_daily_date = None
 last_market_insight_date = None
 last_btc_eth_signals = {"bitcoin": None, "ethereum": None}
 last_token_signals = {"PLS": None, "PLSX": None, "PROVEX": None}
+last_token_alert_time = {"PLS": 0, "PLSX": 0, "PROVEX": 0}
+last_macro_alert_time = {"bitcoin": 0, "ethereum": 0}
 
 # =========================
-# Token Config
+# Config
 # =========================
+TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 30   # 30 minutes
+MACRO_ALERT_COOLDOWN_SECONDS = 60 * 30   # 30 minutes
+
 TOKENS = [
-    {"symbol": "PLS", "search": "PLS pulsechain"},
-    {"symbol": "PLSX", "search": "PLSX pulsechain"},
-    {"symbol": "PROVEX", "search": "PROVEX pulsechain"},
+    {"symbol": "PLS", "search": "PLS pulsechain", "label": "🟢 PLS"},
+    {"symbol": "PLSX", "search": "PLSX pulsechain", "label": "🟣 PLSX"},
+    {"symbol": "PROVEX", "search": "PROVEX pulsechain", "label": "🧪 PROVEX Coin"},
 ]
 
 # =========================
 # Helpers
 # =========================
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def utc_stamp():
+    return now_utc().strftime("%Y-%m-%d %H:%M UTC")
+
 def fmt_pct(v):
     v = float(v or 0)
     sign = "+" if v > 0 else ""
@@ -45,6 +56,15 @@ def fmt_money(v):
         return f"${v/1_000:.2f}K"
     return f"${v:.2f}"
 
+def safe_float(v, default=0.0):
+    try:
+        return float(v or 0)
+    except Exception:
+        return default
+
+def can_send_again(last_sent_ts, cooldown_seconds):
+    return (time.time() - float(last_sent_ts or 0)) >= cooldown_seconds
+
 def send_embed(title: str, description: str, color: int = 0x8E44AD):
     payload = {
         "embeds": [
@@ -52,11 +72,13 @@ def send_embed(title: str, description: str, color: int = 0x8E44AD):
                 "title": title,
                 "description": description,
                 "color": color,
+                "footer": {"text": f"PulseChain Rotation Agent • {utc_stamp()}"},
             }
         ]
     }
     try:
-        client.post(DISCORD_WEBHOOK, json=payload)
+        r = client.post(DISCORD_WEBHOOK, json=payload)
+        r.raise_for_status()
     except Exception as e:
         print("Webhook embed error:", e, flush=True)
 
@@ -79,11 +101,11 @@ def fetch_token_market(search_term: str):
             pairs = pulse_pairs
 
         def score(p):
-            liq = float((p.get("liquidity") or {}).get("usd") or 0)
-            vol = float((p.get("volume") or {}).get("h24") or 0)
-            buys = float((((p.get("txns") or {}).get("h1") or {}).get("buys")) or 0)
-            sells = float((((p.get("txns") or {}).get("h1") or {}).get("sells")) or 0)
-            return liq * 0.6 + vol * 0.3 + (buys + sells) * 50
+            liq = safe_float((p.get("liquidity") or {}).get("usd"))
+            vol_h24 = safe_float((p.get("volume") or {}).get("h24"))
+            buys = safe_float((((p.get("txns") or {}).get("h1") or {}).get("buys")))
+            sells = safe_float((((p.get("txns") or {}).get("h1") or {}).get("sells")))
+            return liq * 0.60 + vol_h24 * 0.30 + (buys + sells) * 50
 
         best = sorted(pairs, key=score, reverse=True)[0]
 
@@ -92,27 +114,33 @@ def fetch_token_market(search_term: str):
         volume = best.get("volume") or {}
         price_change = best.get("priceChange") or {}
 
-        buys_h1 = float(txns_h1.get("buys") or 0)
-        sells_h1 = float(txns_h1.get("sells") or 0)
+        buys_h1 = safe_float(txns_h1.get("buys"))
+        sells_h1 = safe_float(txns_h1.get("sells"))
         ratio_h1 = buys_h1 / max(1.0, sells_h1)
 
-        liq_usd = float(liquidity.get("usd") or 0)
-        vol_h1 = float(volume.get("h1") or 0)
+        liq_usd = safe_float(liquidity.get("usd"))
+        vol_h1 = safe_float(volume.get("h1"))
+        vol_h24 = safe_float(volume.get("h24"))
 
-        h1_change = float(price_change.get("h1") or 0)
-        h6_change = float(price_change.get("h6") or 0)
-        h24_change = float(price_change.get("h24") or 0)
+        h1_change = safe_float(price_change.get("h1"))
+        h6_change = safe_float(price_change.get("h6"))
+        h24_change = safe_float(price_change.get("h24"))
 
-        flow_score = 0
-        flow_score += min(4, ratio_h1) * 1.8
-        flow_score += 1.5 if vol_h1 > 0 and liq_usd > 0 and (vol_h1 / max(liq_usd, 1)) > 0.04 else 0
-        flow_score += 1.0 if h1_change > -4 else 0
-        flow_score = min(flow_score, 10)
+        # scoring
+        flow_score = 0.0
+        flow_score += min(4.0, ratio_h1) * 1.8
+        flow_score += 1.5 if vol_h1 > 0 and liq_usd > 0 and (vol_h1 / max(liq_usd, 1.0)) > 0.04 else 0.0
+        flow_score += 1.0 if h1_change > -4 else 0.0
+        flow_score = min(flow_score, 10.0)
 
         return {
             "symbol": best.get("baseToken", {}).get("symbol") or search_term.split()[0],
+            "pair_address": best.get("pairAddress") or "",
+            "dex_id": best.get("dexId") or "",
+            "url": best.get("url") or "",
             "liq_usd": liq_usd,
             "vol_h1": vol_h1,
+            "vol_h24": vol_h24,
             "buys_h1": buys_h1,
             "sells_h1": sells_h1,
             "ratio_h1": ratio_h1,
@@ -138,7 +166,7 @@ def classify_token_signal(m):
     if (h1 <= -8 or h6 <= -15) and ratio >= 1.4 and flow >= 6.5:
         return "buy_now", "Heavy dip with real buying pressure", "شراء الآن"
 
-    if flow >= 7 and ratio >= 1.35 and h1 <= 5:
+    if flow >= 7.0 and ratio >= 1.35 and h1 <= 5:
         return "strong", "Clear liquidity and buying strength", "عزّز بشكل تدريجي"
 
     if h1 <= -6 or h6 <= -10:
@@ -151,7 +179,7 @@ def classify_token_signal(m):
 
     return "none", "Neutral market, no clear edge", "خليك كاش — انتظار"
 
-def build_token_message(symbol, m, level, summary_en, action_ar):
+def build_token_message(label, m, level, summary_en, action_ar):
     color_map = {
         "watch": 0xF1C40F,
         "strong": 0x2ECC71,
@@ -160,49 +188,60 @@ def build_token_message(symbol, m, level, summary_en, action_ar):
         "risk": 0xC0392B,
     }
 
-    icon_map = {
-        "watch": "🟡",
-        "strong": "🟢",
-        "dip_watch": "🔻",
-        "buy_now": "🚨",
-        "risk": "🔴",
-    }
-
     color = color_map.get(level, 0x8E44AD)
-    icon = icon_map.get(level, "⚪")
-    buy_power = min(10, m["ratio_h1"] * 4.2)
+    buy_power = min(10.0, m["ratio_h1"] * 4.2)
 
-    title = f"{icon} {symbol}"
     desc = (
-        f"**Summary:** {summary_en}\n"
-        f"**Flow Score:** {m['flow_score']:.1f}/10\n"
-        f"**Buy Power:** {buy_power:.1f}/10\n"
+        f"**Market Read:** {summary_en}\n"
+        f"**Liquidity Flow:** {m['flow_score']:.1f}/10\n"
+        f"**Buying Pressure:** {buy_power:.1f}/10\n"
+        f"**Buy/Sell Ratio:** {m['ratio_h1']:.2f}x\n"
         f"**1H Change:** {fmt_pct(m['h1_change'])}\n"
+        f"**6H Change:** {fmt_pct(m['h6_change'])}\n"
+        f"**1H Volume:** {fmt_money(m['vol_h1'])}\n"
         f"**Liquidity:** {fmt_money(m['liq_usd'])}\n\n"
         f"👉 **Take Action:** {action_ar}"
     )
 
-    return title, desc, color
+    return label, desc, color
 
 def monitor_tokens():
+    global last_token_signals, last_token_alert_time
+
     for token in TOKENS:
         market = fetch_token_market(token["search"])
+        print(f"[DEBUG] {token['symbol']} market = {market}", flush=True)
+
         if not market:
             continue
 
         symbol = token["symbol"]
+        label = token["label"]
+
         level, summary_en, action_ar = classify_token_signal(market)
+        print(f"[DEBUG] {symbol} level = {level}", flush=True)
 
         if level == "none":
             continue
 
-        current_signal = f"{level}:{round(market['h1_change'],1)}:{round(market['ratio_h1'],2)}:{round(market['flow_score'],1)}"
-        if last_token_signals.get(symbol) == current_signal:
+        current_signal = (
+            f"{level}:"
+            f"{round(market['h1_change'], 1)}:"
+            f"{round(market['ratio_h1'], 2)}:"
+            f"{round(market['flow_score'], 1)}:"
+            f"{round(market['vol_h1'], 0)}"
+        )
+
+        same_signal = last_token_signals.get(symbol) == current_signal
+        cooldown_ok = can_send_again(last_token_alert_time.get(symbol), TOKEN_ALERT_COOLDOWN_SECONDS)
+
+        if same_signal and not cooldown_ok:
             continue
 
-        title, desc, color = build_token_message(symbol, market, level, summary_en, action_ar)
+        title, desc, color = build_token_message(label, market, level, summary_en, action_ar)
         send_embed(title, desc, color)
         last_token_signals[symbol] = current_signal
+        last_token_alert_time[symbol] = time.time()
 
 # =========================
 # Richard Heart monitor
@@ -236,7 +275,7 @@ def monitor_richard_heart():
 
 def daily_richard_heart_update():
     global last_richard_daily_date
-    today = datetime.now(timezone.utc).date()
+    today = now_utc().date()
 
     if last_richard_daily_date == today:
         return
@@ -266,7 +305,7 @@ def daily_richard_heart_update():
 # BTC / ETH monitor
 # =========================
 def monitor_btc_eth():
-    global last_btc_eth_signals
+    global last_btc_eth_signals, last_macro_alert_time
 
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -275,13 +314,21 @@ def monitor_btc_eth():
             "ids": "bitcoin,ethereum",
             "price_change_percentage": "1h,24h"
         }
-        data = client.get(url, params=params).json()
+        r = client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
 
         for coin in data:
             coin_id = coin["id"]
-            name = coin["name"]
-            ch1 = coin.get("price_change_percentage_1h_in_currency") or 0
-            ch24 = coin.get("price_change_percentage_24h") or 0
+            ch1 = safe_float(coin.get("price_change_percentage_1h_in_currency"))
+            ch24 = safe_float(coin.get("price_change_percentage_24h"))
+
+            if coin_id == "bitcoin":
+                label = "₿ Bitcoin"
+            elif coin_id == "ethereum":
+                label = "⟠ Ethereum"
+            else:
+                label = coin.get("name", coin_id.title())
 
             signal = None
             if ch1 >= 3 or ch24 >= 5:
@@ -292,13 +339,16 @@ def monitor_btc_eth():
             if not signal:
                 continue
 
-            if last_btc_eth_signals.get(coin_id) == signal:
+            same_signal = last_btc_eth_signals.get(coin_id) == signal
+            cooldown_ok = can_send_again(last_macro_alert_time.get(coin_id), MACRO_ALERT_COOLDOWN_SECONDS)
+
+            if same_signal and not cooldown_ok:
                 continue
 
             if signal == "up":
                 send_embed(
-                    f"🚨 {name}",
-                    f"**Summary:** Strong upside move\n"
+                    f"🚨 {label}",
+                    f"**Market Read:** Strong upside move\n"
                     f"**1H Change:** {fmt_pct(ch1)}\n"
                     f"**24H Change:** {fmt_pct(ch24)}\n\n"
                     f"👉 **Take Action:** راقب الزخم — لا تطارد",
@@ -306,8 +356,8 @@ def monitor_btc_eth():
                 )
             else:
                 send_embed(
-                    f"🔻 {name}",
-                    f"**Summary:** Clear downside pressure\n"
+                    f"🔻 {label}",
+                    f"**Market Read:** Clear downside pressure\n"
                     f"**1H Change:** {fmt_pct(ch1)}\n"
                     f"**24H Change:** {fmt_pct(ch24)}\n\n"
                     f"👉 **Take Action:** راقب الدعم — لا تستعجل",
@@ -315,6 +365,7 @@ def monitor_btc_eth():
                 )
 
             last_btc_eth_signals[coin_id] = signal
+            last_macro_alert_time[coin_id] = time.time()
 
     except Exception as e:
         print("BTC/ETH error:", e, flush=True)
@@ -324,7 +375,7 @@ def monitor_btc_eth():
 # =========================
 def daily_market_insight():
     global last_market_insight_date
-    today = datetime.now(timezone.utc).date()
+    today = now_utc().date()
 
     if last_market_insight_date == today:
         return
@@ -332,29 +383,43 @@ def daily_market_insight():
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {"vs_currency": "usd", "ids": "bitcoin,ethereum"}
-        data = client.get(url, params=params).json()
+        r = client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
 
-        btc = data[0]
-        eth = data[1]
+        coin_map = {c["id"]: c for c in data}
+        btc = coin_map.get("bitcoin")
+        eth = coin_map.get("ethereum")
 
-        avg = ((btc.get("price_change_percentage_24h") or 0) + (eth.get("price_change_percentage_24h") or 0)) / 2
+        if not btc or not eth:
+            print("Insight error: BTC or ETH missing", flush=True)
+            return
+
+        btc_24 = safe_float(btc.get("price_change_percentage_24h"))
+        eth_24 = safe_float(eth.get("price_change_percentage_24h"))
+        avg = (btc_24 + eth_24) / 2.0
 
         if avg > 2:
             state = "Bullish"
             action = "راقب — دخول تدريجي"
+            color = 0x2ECC71
         elif avg < -2:
             state = "Bearish"
             action = "خليك كاش — انتظار"
+            color = 0xE74C3C
         else:
             state = "Neutral"
             action = "مراقبة فقط"
+            color = 0x3498DB
 
         send_embed(
             "📊 Market Insight",
             f"**Today:** {state}\n"
+            f"**₿ BTC 24H:** {fmt_pct(btc_24)}\n"
+            f"**⟠ ETH 24H:** {fmt_pct(eth_24)}\n"
             f"**Focus:** BTC and ETH daily trend\n\n"
             f"👉 **Take Action:** {action}",
-            0x3498DB
+            color
         )
 
         last_market_insight_date = today
@@ -366,6 +431,7 @@ def daily_market_insight():
 # Main bot loop
 # =========================
 def run_bot():
+    print("PulseChain Rotation Agent started...", flush=True)
     while True:
         try:
             monitor_tokens()
