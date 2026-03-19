@@ -10,7 +10,7 @@ import httpx
 # =========================================================
 # CONFIG
 # =========================================================
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
+DISCORD_WEBHOOK = "YOUR_NEW_WEBHOOK_HERE"
 
 DEBUG = False
 POLL_SECONDS = 300
@@ -26,9 +26,7 @@ MIN_NEWS_PRICE_MOVE_FOR_ALERT = 1.25
 client = httpx.Client(
     timeout=20.0,
     follow_redirects=True,
-    headers={
-        "User-Agent": "Mozilla/5.0 PulseChainRotationAgent/2.0"
-    }
+    headers={"User-Agent": "Mozilla/5.0 PulseChainRotationAgent/3.0"}
 )
 
 # =========================================================
@@ -46,8 +44,8 @@ last_token_alert_time = {"PLS": 0, "PLSX": 0, "PROVEX": 0}
 last_token_states = {"PLS": "neutral", "PLSX": "neutral", "PROVEX": "neutral"}
 
 last_news_alert_time = 0
-seen_news_titles = {}   # normalized_title -> unix ts
-seen_news_groups = {}   # normalized_group -> unix ts
+seen_news_titles = {}
+seen_news_groups = {}
 
 market_cache = {
     "macro_bias": "neutral",
@@ -68,7 +66,7 @@ market_cache = {
 TOKENS = [
     {"symbol": "PLS", "search": "PLS pulsechain", "label": "🟢 PLS"},
     {"symbol": "PLSX", "search": "PLSX pulsechain", "label": "🟣 PLSX"},
-    {"symbol": "PROVEX", "search": "PROVEX pulsechain", "label": "🧪 PROVEX Coin"},
+    {"symbol": "PROVEX", "search": "PROVEX pulsechain", "label": "🧪 PROVEX"},
 ]
 
 # =========================================================
@@ -95,19 +93,6 @@ def fmt_pct(v):
     sign = "+" if v > 0 else ""
     return f"{sign}{v:.2f}%"
 
-def fmt_money(v):
-    v = safe_float(v)
-    if v >= 1_000_000_000:
-        return f"${v/1_000_000_000:.2f}B"
-    if v >= 1_000_000:
-        return f"${v/1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"${v/1_000:.2f}K"
-    return f"${v:.2f}"
-
-def fmt_ratio(v):
-    return f"{safe_float(v):.2f}x"
-
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -124,7 +109,6 @@ def normalize_text(s):
 
 def strip_source_suffix(title):
     t = title or ""
-    # remove common source suffix patterns
     t = re.sub(r"\s*[-–|]\s*[^-–|]{1,40}$", "", t).strip()
     return t
 
@@ -133,11 +117,8 @@ def normalized_title_key(title):
 
 def normalized_group_key(text):
     text = normalize_text(text)
-    # collapse similar event phrases
     replacements = [
         ("federal reserve", "fed"),
-        ("u s ", "us "),
-        ("sec ", "sec "),
         ("exchange traded fund", "etf"),
         ("ethereum etf", "eth etf"),
         ("bitcoin etf", "btc etf"),
@@ -176,26 +157,14 @@ def send_embed(title, description, color=0x8E44AD, url=None):
         print("Webhook embed error:", e, flush=True)
 
 # =========================================================
-# DISCORD COLORS / LABELS
+# COLORS
 # =========================================================
-SEVERITY_COLOR = {
-    "watch": 0xF1C40F,
-    "strong": 0x2ECC71,
-    "urgent": 0xE74C3C,
-    "risk": 0xC0392B,
-    "info": 0x3498DB,
-    "macro": 0x5865F2,
-}
-
-STATE_ICON = {
-    "neutral": "⚪",
-    "buildup": "🟡",
-    "strong": "🟢",
-    "breakout": "🚀",
-    "dip_buy": "🛒",
-    "risk": "🔴",
-    "flush": "💥",
-}
+GREEN = 0x2ECC71
+RED = 0xE74C3C
+YELLOW = 0xF1C40F
+BLUE = 0x3498DB
+ORANGE = 0xE67E22
+PURPLE = 0x8E44AD
 
 # =========================================================
 # DEXSCREENER
@@ -222,13 +191,11 @@ def fetch_token_market(search_term):
             buys = safe_float(tx_h1.get("buys"))
             sells = safe_float(tx_h1.get("sells"))
 
-            # prefer real, tradable pairs
             pair_score = 0.0
             pair_score += liq * 0.58
             pair_score += vol_h24 * 0.34
             pair_score += (buys + sells) * 45
 
-            # penalty for extremely weak pairs
             if liq < 25_000:
                 pair_score *= 0.65
             if vol_h24 < 15_000:
@@ -262,35 +229,27 @@ def fetch_token_market(search_term):
         h24_change = safe_float(price_change.get("h24"))
 
         volume_to_liquidity = vol_h1 / max(liq_usd, 1.0)
-        volume_spike_score = clamp((volume_to_liquidity / 0.05) * 2.2, 0, 3.0)
 
-        absorption_score = 0.0
+        flow_score = 0.0
+        flow_score += clamp(min(4.0, ratio_h1) * 1.55, 0, 6.2)
+        flow_score += clamp((volume_to_liquidity / 0.05) * 2.2, 0, 3.0)
+
         if h1_change < 0 and ratio_h1 >= 1.2:
-            absorption_score += 1.5
+            flow_score += 1.5
         if h6_change < 0 and ratio_h24 >= 1.05:
-            absorption_score += 1.0
-
-        trend_score = 0.0
+            flow_score += 1.0
         if h1_change > 0:
-            trend_score += 0.8
+            flow_score += 0.8
         if h6_change > 0:
-            trend_score += 1.0
-        if h24_change > 0:
-            trend_score += 0.8
+            flow_score += 1.0
 
-        pressure_score = clamp(min(4.0, ratio_h1) * 1.55, 0, 6.2)
-
-        liquidity_quality = 0.0
         if liq_usd >= 1_000_000:
-            liquidity_quality = 2.0
+            flow_score += 1.8
         elif liq_usd >= 250_000:
-            liquidity_quality = 1.4
+            flow_score += 1.2
         elif liq_usd >= 75_000:
-            liquidity_quality = 0.9
-        elif liq_usd >= 25_000:
-            liquidity_quality = 0.45
+            flow_score += 0.8
 
-        flow_score = pressure_score + volume_spike_score + absorption_score + trend_score + liquidity_quality
         flow_score = clamp(flow_score, 0, 10)
 
         fake_pump_risk = 0.0
@@ -309,8 +268,6 @@ def fetch_token_market(search_term):
 
         return {
             "symbol": best.get("baseToken", {}).get("symbol") or search_term.split()[0],
-            "pair_address": best.get("pairAddress") or "",
-            "dex_id": best.get("dexId") or "",
             "url": best.get("url") or "",
             "liq_usd": liq_usd,
             "vol_h1": vol_h1,
@@ -402,7 +359,7 @@ def macro_alignment_bonus(token_market):
     return bonus
 
 # =========================================================
-# TOKEN SIGNAL ENGINE
+# SHORT SMART TOKEN MESSAGES
 # =========================================================
 def derive_token_state(m):
     ratio = m["ratio_h1"]
@@ -413,73 +370,127 @@ def derive_token_state(m):
     fake_risk = m["fake_pump_risk"]
 
     if (h1 <= -8 or h6 <= -15) and ratio >= 1.35 and flow >= 6.2:
-        return "dip_buy", "urgent", "Heavy dip with real buying absorption", "شراء الآن"
+        return "dip_buy", "bullish", "شراء الآن"
 
     if h1 <= -8 and ratio < 1.0 and conf < 5:
-        return "flush", "risk", "Sharp downside with weak support", "لا دخول — انتبه"
+        return "flush", "bearish", "لا دخول — انتبه"
 
     if flow >= 7.4 and ratio >= 1.30 and h1 >= -2:
         if h1 >= 2 or h6 >= 5:
-            return "breakout", "urgent", "Momentum breakout with real flow", "راقب الاختراق — لا تطارد بعنف"
-        return "strong", "strong", "Clear liquidity and buying strength", "عزّز بشكل تدريجي"
+            return "breakout", "bullish", "راقب الاختراق — لا تطارد"
+        return "strong", "bullish", "عزّز بشكل تدريجي"
 
     if flow >= 5.8 and ratio >= 1.12:
-        return "buildup", "watch", "Activity is building under the surface", "راقب — دخول تدريجي"
+        return "buildup", "watch", "راقب — دخول تدريجي"
 
     if h1 <= -6 or h6 <= -10:
         if ratio >= 1.05:
-            return "buildup", "watch", "Drop is being absorbed by buyers", "راقب الارتداد — لا تستعجل"
-        return "risk", "risk", "Sell pressure is stronger than demand", "خليك كاش — خطر"
+            return "buildup", "watch", "راقب الارتداد — لا تستعجل"
+        return "risk", "bearish", "خليك كاش — خطر"
 
     if fake_risk >= 2.5:
-        return "risk", "risk", "Move looks overheated or low-quality", "لا تطارد — انتظر تأكيد"
+        return "risk", "bearish", "لا تطارد — انتظر تأكيد"
 
-    return "neutral", "info", "Neutral market with no clear edge", "خليك كاش — انتظار"
+    return "neutral", "neutral", "خليك كاش — انتظار"
+
+def token_summary_line(symbol, state, m):
+    if symbol == "PLS":
+        if state in ("strong", "breakout", "dip_buy", "buildup"):
+            return "🧠 السوق عم يجمع بولس"
+        if state in ("risk", "flush"):
+            return "🧠 في ضغط بيع على بولس"
+        return "🧠 بولس بدون اتجاه واضح"
+
+    if symbol == "PLSX":
+        if state in ("strong", "breakout", "dip_buy", "buildup"):
+            return "🧠 السوق عم يجمع بولس اكس"
+        if state in ("risk", "flush"):
+            return "🧠 في ضغط بيع على بولس اكس"
+        return "🧠 بولس اكس بدون اتجاه واضح"
+
+    if symbol == "PROVEX":
+        if state in ("strong", "breakout", "dip_buy", "buildup"):
+            return "🧠 في تجميع على PROVEX"
+        if state in ("risk", "flush"):
+            return "🧠 PROVEX تحت ضغط"
+        return "🧠 PROVEX هادئة"
+
+    return "🧠 السوق غير واضح"
+
+def token_reason_lines(m, state, mood):
+    lines = []
+
+    if mood == "bullish":
+        if m["ratio_h1"] >= 1.2:
+            lines.append("📈 المشترين أقوى من البائعين")
+        if m["h1_change"] < 0 and m["ratio_h1"] >= 1.1:
+            lines.append("🛡️ الهبوط عم ينشفط شراء")
+        if m["vol_liq_ratio_h1"] >= 0.04:
+            lines.append("💧 في تدفق سيولة حقيقي")
+        if market_cache.get("macro_bias") == "bullish":
+            lines.append("🌤️ السوق العام مساعد")
+
+    elif mood == "bearish":
+        if m["ratio_h1"] < 1.0:
+            lines.append("📉 البائعين أقوى من المشترين")
+        if m["h1_change"] <= -4 or m["h6_change"] <= -8:
+            lines.append("🌧️ في ضغط نزول واضح")
+        if market_cache.get("macro_bias") == "bearish":
+            lines.append("⚠️ السوق العام سلبي")
+        if m["fake_pump_risk"] >= 2.5:
+            lines.append("🔥 الحركة شكلها مو نظيف")
+
+    elif mood == "watch":
+        if m["ratio_h1"] >= 1.05:
+            lines.append("👀 في مراقبة وتجميع خفيف")
+        if m["h1_change"] < 0:
+            lines.append("↩️ احتمال ارتداد إذا ثبت الشراء")
+        if market_cache.get("macro_bias") == "neutral":
+            lines.append("🫥 السوق العام محايد")
+
+    # keep it short
+    return lines[:3]
 
 def build_token_signal(symbol, label, m):
-    state, severity, market_read, action_ar = derive_token_state(m)
-
+    state, mood, action_ar = derive_token_state(m)
     confidence = clamp(m["confidence"] + macro_alignment_bonus(m), 1, 10)
 
-    reasons = []
-    if m["ratio_h1"] >= 1.2:
-        reasons.append("buyers > sellers")
-    if m["vol_liq_ratio_h1"] >= 0.04:
-        reasons.append("real flow vs liquidity")
-    if m["h1_change"] < 0 and m["ratio_h1"] >= 1.1:
-        reasons.append("dip absorption")
-    if m["h1_change"] > 0 and m["h6_change"] > 0:
-        reasons.append("trend confirmation")
-    if market_cache.get("macro_bias") == "bullish":
-        reasons.append("macro tailwind")
-    elif market_cache.get("macro_bias") == "bearish" and state in ("risk", "flush"):
-        reasons.append("macro pressure")
+    line1 = token_summary_line(symbol, state, m)
+    reason_lines = token_reason_lines(m, state, mood)
 
-    if not reasons:
-        reasons.append("market structure not clean")
+    if mood == "bullish":
+        color = GREEN
+        mood_emoji = "🟢"
+    elif mood == "bearish":
+        color = RED
+        mood_emoji = "🔴"
+    elif mood == "watch":
+        color = YELLOW
+        mood_emoji = "🟡"
+    else:
+        color = PURPLE
+        mood_emoji = "⚪"
 
-    why_line = ", ".join(reasons[:3])
+    compact_conf = ""
+    if confidence >= 8.5:
+        compact_conf = "✅ الثقة عالية"
+    elif confidence >= 7:
+        compact_conf = "☑️ الإشارة جيدة"
+    elif mood in ("bullish", "bearish", "watch"):
+        compact_conf = "🪫 الإشارة متوسطة"
 
-    desc = (
-        f"**Market Read:** {market_read}\n"
-        f"**State:** {state.title()}\n"
-        f"**Severity:** {severity.title()}\n"
-        f"**Confidence:** {confidence:.1f}/10\n"
-        f"**Liquidity Flow:** {m['flow_score']:.1f}/10\n"
-        f"**Buy/Sell Ratio:** {fmt_ratio(m['ratio_h1'])}\n"
-        f"**1H Change:** {fmt_pct(m['h1_change'])}\n"
-        f"**6H Change:** {fmt_pct(m['h6_change'])}\n"
-        f"**1H Volume:** {fmt_money(m['vol_h1'])}\n"
-        f"**Liquidity:** {fmt_money(m['liq_usd'])}\n"
-        f"**Why Now:** {why_line}\n\n"
-        f"👉 **Take Action:** {action_ar}"
-    )
+    lines = [line1]
+    lines.extend(reason_lines)
+    if compact_conf:
+        lines.append(compact_conf)
 
-    title = f"{STATE_ICON.get(state, '⚪')} {label}"
-    color = SEVERITY_COLOR.get(severity, 0x8E44AD)
-    return state, severity, confidence, title, desc, color
+    desc = "\n".join(f"- {x}" for x in lines)
+    desc += f"\n\n👉 **Take Action:** {action_ar}"
 
-def should_send_token_alert(symbol, state, severity, confidence, current_signal):
+    title = f"{mood_emoji} {label}"
+    return state, mood, confidence, title, desc, color
+
+def should_send_token_alert(symbol, state, mood, confidence, current_signal):
     previous_state = last_token_states.get(symbol, "neutral")
     previous_signal = last_token_signals.get(symbol)
     cooldown_ok = can_send_again(last_token_alert_time.get(symbol), TOKEN_ALERT_COOLDOWN_SECONDS)
@@ -487,19 +498,16 @@ def should_send_token_alert(symbol, state, severity, confidence, current_signal)
     state_changed = state != previous_state
     signal_changed = current_signal != previous_signal
 
-    if state in ("neutral",):
+    if state == "neutral":
         return False
 
-    # always send urgent state transitions
-    if state_changed and severity in ("urgent", "risk"):
+    if state_changed and mood in ("bullish", "bearish"):
         return True
 
-    # strong signals can send if changed enough
     if signal_changed and confidence >= 7.0 and cooldown_ok:
         return True
 
-    # watch signals only if state changed out of neutral/risk
-    if state_changed and severity == "watch" and previous_state in ("neutral", "risk", "flush"):
+    if state_changed and mood == "watch" and previous_state in ("neutral", "risk", "flush"):
         return True
 
     return False
@@ -517,10 +525,10 @@ def monitor_tokens():
         symbol = token["symbol"]
         label = token["label"]
 
-        state, severity, confidence, title, desc, color = build_token_signal(symbol, label, market)
+        state, mood, confidence, title, desc, color = build_token_signal(symbol, label, market)
 
         current_signal = (
-            f"{state}|{severity}|"
+            f"{state}|{mood}|"
             f"{round(market['h1_change'],1)}|"
             f"{round(market['h6_change'],1)}|"
             f"{round(market['ratio_h1'],2)}|"
@@ -528,7 +536,7 @@ def monitor_tokens():
             f"{round(confidence,1)}"
         )
 
-        if should_send_token_alert(symbol, state, severity, confidence, current_signal):
+        if should_send_token_alert(symbol, state, mood, confidence, current_signal):
             send_embed(title, desc, color, url=market.get("url") or None)
             last_token_alert_time[symbol] = time.time()
 
@@ -554,15 +562,15 @@ def monitor_richard_heart():
         if online:
             send_embed(
                 "🟢 RichardHeart.com",
-                "**Status:** Online\n**Why Now:** status changed from offline to online\n\n👉 **Take Action:** راقب لاحتمال عودة النشاط أو بث",
-                SEVERITY_COLOR["strong"],
+                "- 🧠 الموقع رجع أونلاين\n- 👀 احتمال في نشاط أو حركة قريبة\n\n👉 **Take Action:** راقب لاحتمال عودة النشاط أو بث",
+                GREEN,
                 url="https://richardheart.com/"
             )
         else:
             send_embed(
                 "🔴 RichardHeart.com",
-                "**Status:** Offline\n**Why Now:** status changed from online to offline\n\n👉 **Take Action:** لا تغيير حالياً",
-                SEVERITY_COLOR["risk"],
+                "- 🧠 الموقع أوفلاين الآن\n- 😴 ما في تغيير مهم حاليًا\n\n👉 **Take Action:** لا تغيير حالياً",
+                RED,
                 url="https://richardheart.com/"
             )
         last_richard_status = online
@@ -583,22 +591,22 @@ def daily_richard_heart_update():
     if online:
         send_embed(
             "🟢 RichardHeart.com — Daily Update",
-            "**Status:** Online\n\n👉 **Take Action:** راقب لأي نشاط أو بث",
-            SEVERITY_COLOR["strong"],
+            "- 🌞 الموقع أونلاين اليوم\n- 👀 خليك منتبه لأي نشاط\n\n👉 **Take Action:** راقب لأي نشاط أو بث",
+            GREEN,
             url="https://richardheart.com/"
         )
     else:
         send_embed(
             "🔴 RichardHeart.com — Daily Update",
-            "**Status:** Offline\n\n👉 **Take Action:** لا تغيير اليوم",
-            SEVERITY_COLOR["risk"],
+            "- 🌙 الموقع أوفلاين اليوم\n- 💤 ما في جديد مهم\n\n👉 **Take Action:** لا تغيير اليوم",
+            RED,
             url="https://richardheart.com/"
         )
 
     last_richard_daily_date = today
 
 # =========================================================
-# BTC / ETH ALERTS
+# BTC / ETH
 # =========================================================
 def monitor_btc_eth():
     global last_btc_eth_signals, last_macro_alert_time
@@ -616,24 +624,21 @@ def monitor_btc_eth():
                 ch24 = market_cache["eth_24h"]
 
             signal = None
-            severity = "info"
-            market_read = None
+            mood = None
             action_ar = None
-            color = SEVERITY_COLOR["macro"]
+            summary = None
 
             if ch1 >= 3.0 or ch24 >= 5.0:
                 signal = "up"
-                severity = "urgent" if (ch1 >= 4.2 or ch24 >= 7.0) else "strong"
-                market_read = "Strong upside move"
+                mood = "bullish"
+                summary = "🧠 السوق عم يدفع لفوق"
                 action_ar = "راقب الزخم — لا تطارد"
-                color = SEVERITY_COLOR["strong"] if severity == "strong" else SEVERITY_COLOR["urgent"]
 
             elif ch1 <= -3.0 or ch24 <= -5.0:
                 signal = "down"
-                severity = "urgent" if (ch1 <= -4.2 or ch24 <= -7.0) else "watch"
-                market_read = "Clear downside pressure"
+                mood = "bearish"
+                summary = "🧠 في ضغط بيع واضح"
                 action_ar = "راقب الدعم — لا تستعجل"
-                color = SEVERITY_COLOR["risk"] if severity == "urgent" else 0xE67E22
 
             if not signal:
                 continue
@@ -644,17 +649,26 @@ def monitor_btc_eth():
             if same_signal and not cooldown_ok:
                 continue
 
-            desc = (
-                f"**Market Read:** {market_read}\n"
-                f"**Severity:** {severity.title()}\n"
-                f"**1H Change:** {fmt_pct(ch1)}\n"
-                f"**24H Change:** {fmt_pct(ch24)}\n"
-                f"**Macro Bias:** {market_cache.get('macro_bias', 'neutral').title()}\n\n"
-                f"👉 **Take Action:** {action_ar}"
-            )
+            if mood == "bullish":
+                color = GREEN
+                lines = [
+                    summary,
+                    "📈 الحركة قوية على الماكرو",
+                    "🌤️ هذا الشي ممكن يساعد الألتات",
+                ]
+            else:
+                color = RED
+                lines = [
+                    summary,
+                    "📉 السوق العام متوتر",
+                    "⚠️ هذا الشي يضغط على الألتات",
+                ]
 
-            title_icon = "🚨" if signal == "up" else "🔻"
-            send_embed(f"{title_icon} {label}", desc, color)
+            desc = "\n".join(f"- {x}" for x in lines)
+            desc += f"\n\n👉 **Take Action:** {action_ar}"
+
+            icon = "🟢" if signal == "up" else "🔴"
+            send_embed(f"{icon} {label}", desc, color)
 
             last_btc_eth_signals[coin_id] = signal
             last_macro_alert_time[coin_id] = time.time()
@@ -681,35 +695,46 @@ def daily_market_insight():
         avg = (btc_24 + eth_24) / 2.0
 
         if avg > 2:
-            state = "Bullish"
+            title = "🟢 Market Insight"
+            color = GREEN
+            lines = [
+                "🧠 السوق العام إيجابي اليوم",
+                "🌤️ بيتكوين وإيثيريوم داعمين الحركة",
+                "🚀 الألتات ممكن تاخد نفس"
+            ]
             action = "راقب — دخول تدريجي"
-            color = SEVERITY_COLOR["strong"]
+
         elif avg < -2:
-            state = "Bearish"
+            title = "🔴 Market Insight"
+            color = RED
+            lines = [
+                "🧠 السوق العام سلبي اليوم",
+                "🌧️ في ضغط على بيتكوين وإيثيريوم",
+                "⚠️ الألتات تحت تهديد"
+            ]
             action = "خليك كاش — انتظار"
-            color = SEVERITY_COLOR["risk"]
+
         else:
-            state = "Neutral"
+            title = "🟡 Market Insight"
+            color = YELLOW
+            lines = [
+                "🧠 السوق العام محايد",
+                "😐 ما في اتجاه قوي",
+                "👀 الأفضل مراقبة فقط"
+            ]
             action = "مراقبة فقط"
-            color = SEVERITY_COLOR["info"]
 
-        send_embed(
-            "📊 Market Insight",
-            f"**Today:** {state}\n"
-            f"**₿ BTC 24H:** {fmt_pct(btc_24)}\n"
-            f"**⟠ ETH 24H:** {fmt_pct(eth_24)}\n"
-            f"**Macro Bias:** {market_cache.get('macro_bias', 'neutral').title()}\n\n"
-            f"👉 **Take Action:** {action}",
-            color
-        )
+        desc = "\n".join(f"- {x}" for x in lines)
+        desc += f"\n\n👉 **Take Action:** {action}"
 
+        send_embed(title, desc, color)
         last_market_insight_date = today
 
     except Exception as e:
         print("Insight error:", e, flush=True)
 
 # =========================================================
-# NEWS ENGINE
+# NEWS
 # =========================================================
 NEWS_FEEDS = [
     {
@@ -754,11 +779,7 @@ def fetch_rss_items(url):
             link = (item.findtext("link") or "").strip()
             pub_date = (item.findtext("pubDate") or "").strip()
             if title and link:
-                items.append({
-                    "title": title,
-                    "link": link,
-                    "pubDate": pub_date,
-                })
+                items.append({"title": title, "link": link, "pubDate": pub_date})
         return items
     except Exception as e:
         print("RSS fetch error:", e, flush=True)
@@ -792,7 +813,6 @@ def headline_score_and_direction(title):
     elif bear > bull:
         direction = "bearish"
 
-    # market-moving boost
     if "etf" in t:
         total += 1
     if "hack" in t or "collapse" in t or "bankruptcy" in t:
@@ -802,51 +822,20 @@ def headline_score_and_direction(title):
 
     return total, direction, context
 
-def explain_news_impact(direction, context):
-    macro = market_cache.get("macro_bias", "neutral")
-    btc_24 = market_cache.get("btc_24h", 0.0)
-    eth_24 = market_cache.get("eth_24h", 0.0)
-
-    if direction == "bearish":
-        if abs(btc_24) >= MIN_NEWS_PRICE_MOVE_FOR_ALERT or abs(eth_24) >= MIN_NEWS_PRICE_MOVE_FOR_ALERT:
-            return "Headline aligns with current risk-off price action"
-        return "Negative headline, but price confirmation is still limited"
-
-    if direction == "bullish":
-        if btc_24 >= MIN_NEWS_PRICE_MOVE_FOR_ALERT or eth_24 >= MIN_NEWS_PRICE_MOVE_FOR_ALERT:
-            return "Headline supports current upside momentum"
-        return "Positive headline, but market has not fully confirmed yet"
-
-    if macro != "neutral":
-        return f"Macro bias is {macro}, keep position sizing disciplined"
-    return "This may matter if price starts reacting"
-
-def action_from_news(direction, context):
-    if direction == "bearish":
-        return "خفف الاندفاع — راقب السيولة والدعم"
-    if direction == "bullish":
-        return "راقب الزخم — لا تطارد بدون تأكيد"
-    return "مراقبة فقط"
-
 def news_is_relevant(total_score, direction, context):
     if total_score < MIN_NEWS_SCORE:
         return False
-
     if direction == "neutral":
         return False
-
-    # must be crypto-relevant
     if not context:
         return False
 
-    # confirm with price action OR very strong headline
     btc_move = abs(market_cache.get("btc_24h", 0.0))
     eth_move = abs(market_cache.get("eth_24h", 0.0))
     if total_score >= 7:
         return True
     if btc_move >= MIN_NEWS_PRICE_MOVE_FOR_ALERT or eth_move >= MIN_NEWS_PRICE_MOVE_FOR_ALERT:
         return True
-
     return False
 
 def dedupe_news_items(items):
@@ -868,6 +857,24 @@ def collect_news_candidates():
         items.extend(fetch_rss_items(feed["url"]))
     return dedupe_news_items(items)
 
+def explain_news_simple(direction):
+    if direction == "bullish":
+        return [
+            "🧠 في خبر داعم للسوق",
+            "📈 الخبر ممكن يشرح سبب الطلوع",
+            "👀 راقب إذا السوق كمل تأكيد"
+        ]
+    if direction == "bearish":
+        return [
+            "🧠 في خبر ضاغط على السوق",
+            "📉 الخبر ممكن يشرح سبب الهبوط",
+            "⚠️ انتبه من الذعر والمطاردة"
+        ]
+    return [
+        "🧠 في خبر مهم",
+        "👀 راقب التفاعل",
+    ]
+
 def pick_best_news_event():
     cleanup_seen_news()
     candidates = collect_news_candidates()
@@ -876,21 +883,19 @@ def pick_best_news_event():
     for item in candidates:
         title = item["title"]
         key = normalized_title_key(title)
-
         total_score, direction, context = headline_score_and_direction(title)
+
         if not news_is_relevant(total_score, direction, context):
             continue
 
         group_key = normalized_group_key(title)
 
-        # avoid repeated same title/group
         if key in seen_news_titles:
             continue
         if group_key in seen_news_groups and (time.time() - seen_news_groups[group_key]) < (QUIET_HOURS_BETWEEN_SAME_NEWS * 3600):
             continue
 
         score = total_score
-        # boost if direction aligns with price move
         if direction == "bullish" and (market_cache.get("btc_24h", 0) > 0 or market_cache.get("eth_24h", 0) > 0):
             score += 1
         if direction == "bearish" and (market_cache.get("btc_24h", 0) < 0 or market_cache.get("eth_24h", 0) < 0):
@@ -919,38 +924,24 @@ def monitor_major_news():
             return
 
         score, item, direction, context, group_key, key = best
-        title = strip_source_suffix(item["title"])
-        impact = explain_news_impact(direction, context)
-        action = action_from_news(direction, context)
+        title_clean = strip_source_suffix(item["title"])
 
-        severity = "strong"
-        color = SEVERITY_COLOR["macro"]
-        icon = "📰"
+        if direction == "bullish":
+            color = GREEN
+            header = "🟢 Major Market News"
+            action = "راقب الزخم — لا تطارد بدون تأكيد"
+        else:
+            color = RED
+            header = "🔴 Major Market News"
+            action = "خفف الاندفاع — راقب السيولة والدعم"
 
-        if direction == "bearish":
-            icon = "🚨"
-            color = SEVERITY_COLOR["risk"] if score >= 7 else 0xE67E22
-            severity = "urgent" if score >= 7 else "watch"
-        elif direction == "bullish":
-            icon = "🟢"
-            color = SEVERITY_COLOR["strong"] if score >= 7 else 0x27AE60
-            severity = "urgent" if score >= 7 else "strong"
+        lines = explain_news_simple(direction)
+        lines.append(f"📰 {title_clean}")
 
-        context_label = ", ".join(sorted(set(context))).title() if context else "Crypto"
+        desc = "\n".join(f"- {x}" for x in lines[:4])
+        desc += f"\n\n👉 **Take Action:** {action}"
 
-        desc = (
-            f"**Headline:** {title}\n"
-            f"**Direction:** {direction.title()}\n"
-            f"**Severity:** {severity.title()}\n"
-            f"**News Score:** {score}/10\n"
-            f"**Context:** {context_label}\n"
-            f"**Market Impact:** {impact}\n"
-            f"**₿ BTC 24H:** {fmt_pct(market_cache.get('btc_24h', 0))}\n"
-            f"**⟠ ETH 24H:** {fmt_pct(market_cache.get('eth_24h', 0))}\n\n"
-            f"👉 **Take Action:** {action}"
-        )
-
-        send_embed(f"{icon} Major Market News", desc, color, url=item["link"])
+        send_embed(header, desc, color, url=item["link"])
 
         seen_news_titles[key] = time.time()
         seen_news_groups[group_key] = time.time()
@@ -963,7 +954,7 @@ def monitor_major_news():
 # MAIN LOOP
 # =========================================================
 def run_bot():
-    print("PulseChain Rotation Agent PRO started...", flush=True)
+    print("PulseChain Rotation Agent SIMPLE PRO started...", flush=True)
     while True:
         try:
             refresh_macro_market()
