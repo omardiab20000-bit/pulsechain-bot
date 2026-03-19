@@ -2,12 +2,9 @@ import time
 from datetime import datetime, timezone
 import httpx
 
-# =========================
-# Discord Webhook
-# =========================
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
 
-client = httpx.Client(timeout=20.0)
+client = httpx.Client(timeout=20.0, follow_redirects=True)
 
 # =========================
 # State
@@ -20,8 +17,6 @@ last_token_signals = {"PLS": None, "PLSX": None, "PROVEX": None}
 
 # =========================
 # Token Config
-# IMPORTANT:
-# إذا عندك addresses أدق من هدول، بدّلهم لاحقاً
 # =========================
 TOKENS = [
     {"symbol": "PLS", "search": "PLS pulsechain"},
@@ -32,19 +27,14 @@ TOKENS = [
 # =========================
 # Helpers
 # =========================
-def send(msg: str):
-    try:
-        client.post(DISCORD_WEBHOOK, json={"content": msg})
-    except Exception as e:
-        print("Webhook send error:", e)
-
 def fmt_pct(v):
+    v = float(v or 0)
     sign = "+" if v > 0 else ""
     return f"{sign}{v:.2f}%"
 
 def fmt_money(v):
     try:
-        v = float(v)
+        v = float(v or 0)
     except Exception:
         return "$0"
     if v >= 1_000_000_000:
@@ -54,6 +44,21 @@ def fmt_money(v):
     if v >= 1_000:
         return f"${v/1_000:.2f}K"
     return f"${v:.2f}"
+
+def send_embed(title: str, description: str, color: int = 0x8E44AD):
+    payload = {
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "color": color,
+            }
+        ]
+    }
+    try:
+        client.post(DISCORD_WEBHOOK, json=payload)
+    except Exception as e:
+        print("Webhook embed error:", e, flush=True)
 
 # =========================
 # DexScreener token fetch
@@ -118,7 +123,7 @@ def fetch_token_market(search_term: str):
         }
 
     except Exception as e:
-        print("Dex fetch error:", search_term, e)
+        print("Dex fetch error:", search_term, e, flush=True)
         return None
 
 # =========================
@@ -130,46 +135,54 @@ def classify_token_signal(m):
     h1 = m["h1_change"]
     h6 = m["h6_change"]
 
-    # هبوط قوي + شراء واضح = فرصة شراء
     if (h1 <= -8 or h6 <= -15) and ratio >= 1.4 and flow >= 6.5:
-        return "buy_now", "هبوط قوي مع شراء واضح من السوق", "شراء الآن"
+        return "buy_now", "Heavy dip with real buying pressure", "شراء الآن"
 
-    # قوة واضحة = عزز تدريجي
     if flow >= 7 and ratio >= 1.35 and h1 <= 5:
-        return "strong", "سيولة وشراء واضح — في قوة بالسوق", "عزّز بشكل تدريجي"
+        return "strong", "Clear liquidity and buying strength", "عزّز بشكل تدريجي"
 
-    # هبوط يحتاج مراقبة
     if h1 <= -6 or h6 <= -10:
         if ratio >= 1.1:
-            return "dip_watch", "هبوط واضح لكن في ناس عم تشتري", "راقب الارتداد — لا تستعجل"
-        return "risk", "ضغط بيع واضح وما في تأكيد شراء كافي", "لا دخول — انتبه"
+            return "dip_watch", "Strong drop but buyers are stepping in", "راقب الارتداد — لا تستعجل"
+        return "risk", "Sell pressure is stronger than demand", "لا دخول — انتبه"
 
-    # حركة وتجميع
     if flow >= 5.8 and ratio >= 1.15:
-        return "watch", "في حركة وتجميع يستحق المتابعة", "راقب — دخول تدريجي"
+        return "watch", "Market activity is building", "راقب — دخول تدريجي"
 
-    return "none", "الوضع محايد — ما في إشارة قوية", "خليك كاش — انتظار"
+    return "none", "Neutral market, no clear edge", "خليك كاش — انتظار"
 
-def build_token_message(symbol, m, level, summary_ar, action_ar):
-    icon = {
+def build_token_message(symbol, m, level, summary_en, action_ar):
+    color_map = {
+        "watch": 0xF1C40F,
+        "strong": 0x2ECC71,
+        "dip_watch": 0xE67E22,
+        "buy_now": 0xE74C3C,
+        "risk": 0xC0392B,
+    }
+
+    icon_map = {
         "watch": "🟡",
         "strong": "🟢",
         "dip_watch": "🔻",
         "buy_now": "🚨",
         "risk": "🔴",
-    }.get(level, "⚪")
+    }
 
+    color = color_map.get(level, 0x8E44AD)
+    icon = icon_map.get(level, "⚪")
     buy_power = min(10, m["ratio_h1"] * 4.2)
 
-    return (
-        f"{icon} **{symbol}**\n"
-        f"**الزبدة:** {summary_ar}\n"
-        f"**تدفق السيولة:** {m['flow_score']:.1f}/10\n"
-        f"**قوة الشراء:** {buy_power:.1f}/10\n"
-        f"**التغيّر 1س:** {fmt_pct(m['h1_change'])}\n"
-        f"**السيولة:** {fmt_money(m['liq_usd'])}\n"
+    title = f"{icon} {symbol}"
+    desc = (
+        f"**Summary:** {summary_en}\n"
+        f"**Flow Score:** {m['flow_score']:.1f}/10\n"
+        f"**Buy Power:** {buy_power:.1f}/10\n"
+        f"**1H Change:** {fmt_pct(m['h1_change'])}\n"
+        f"**Liquidity:** {fmt_money(m['liq_usd'])}\n\n"
         f"👉 **Take Action:** {action_ar}"
     )
+
+    return title, desc, color
 
 def monitor_tokens():
     for token in TOKENS:
@@ -178,7 +191,7 @@ def monitor_tokens():
             continue
 
         symbol = token["symbol"]
-        level, summary_ar, action_ar = classify_token_signal(market)
+        level, summary_en, action_ar = classify_token_signal(market)
 
         if level == "none":
             continue
@@ -187,8 +200,8 @@ def monitor_tokens():
         if last_token_signals.get(symbol) == current_signal:
             continue
 
-        msg = build_token_message(symbol, market, level, summary_ar, action_ar)
-        send(msg)
+        title, desc, color = build_token_message(symbol, market, level, summary_en, action_ar)
+        send_embed(title, desc, color)
         last_token_signals[symbol] = current_signal
 
 # =========================
@@ -197,7 +210,7 @@ def monitor_tokens():
 def monitor_richard_heart():
     global last_richard_status
     try:
-        r = client.get("https://richardheart.com/", follow_redirects=True)
+        r = client.get("https://richardheart.com/")
         online = 200 <= r.status_code < 400
     except Exception:
         online = False
@@ -208,16 +221,16 @@ def monitor_richard_heart():
 
     if online != last_richard_status:
         if online:
-            send(
-                "🟢 **RichardHeart.com**\n"
-                "**الحالة:** Online\n"
-                "👉 **الزبدة:** الموقع رجع — راقب لاحتمال عودة النشاط أو بث"
+            send_embed(
+                "🟢 RichardHeart.com",
+                "**Status:** Online\n\n👉 **Take Action:** راقب لاحتمال عودة النشاط أو بث",
+                0x2ECC71
             )
         else:
-            send(
-                "🔴 **RichardHeart.com**\n"
-                "**الحالة:** Offline\n"
-                "👉 **الزبدة:** الموقع مطفي — لا تغيير حالياً"
+            send_embed(
+                "🔴 RichardHeart.com",
+                "**Status:** Offline\n\n👉 **Take Action:** لا تغيير حالياً",
+                0xE74C3C
             )
         last_richard_status = online
 
@@ -229,22 +242,22 @@ def daily_richard_heart_update():
         return
 
     try:
-        r = client.get("https://richardheart.com/", follow_redirects=True)
+        r = client.get("https://richardheart.com/")
         online = 200 <= r.status_code < 400
     except Exception:
         online = False
 
     if online:
-        send(
-            "🟢 **RichardHeart.com — Daily Update**\n"
-            "**الحالة:** Online\n"
-            "👉 **الزبدة:** الموقع شغال اليوم — راقب لأي نشاط أو بث"
+        send_embed(
+            "🟢 RichardHeart.com — Daily Update",
+            "**Status:** Online\n\n👉 **Take Action:** راقب لأي نشاط أو بث",
+            0x2ECC71
         )
     else:
-        send(
-            "🔴 **RichardHeart.com — Daily Update**\n"
-            "**الحالة:** Offline\n"
-            "👉 **الزبدة:** الموقع ما زال متوقف اليوم"
+        send_embed(
+            "🔴 RichardHeart.com — Daily Update",
+            "**Status:** Offline\n\n👉 **Take Action:** لا تغيير اليوم",
+            0xE74C3C
         )
 
     last_richard_daily_date = today
@@ -283,22 +296,28 @@ def monitor_btc_eth():
                 continue
 
             if signal == "up":
-                send(
-                    f"🚨 **{name}**\n"
-                    f"**الزبدة:** صعود قوي {ch1:.2f}% خلال 1س / {ch24:.2f}% خلال 24س\n"
-                    f"👉 **Take Action:** راقب الزخم — لا تطارد"
+                send_embed(
+                    f"🚨 {name}",
+                    f"**Summary:** Strong upside move\n"
+                    f"**1H Change:** {fmt_pct(ch1)}\n"
+                    f"**24H Change:** {fmt_pct(ch24)}\n\n"
+                    f"👉 **Take Action:** راقب الزخم — لا تطارد",
+                    0x2ECC71
                 )
             else:
-                send(
-                    f"🔻 **{name}**\n"
-                    f"**الزبدة:** هبوط واضح {ch1:.2f}% خلال 1س / {ch24:.2f}% خلال 24س\n"
-                    f"👉 **Take Action:** راقب الدعم — لا تستعجل"
+                send_embed(
+                    f"🔻 {name}",
+                    f"**Summary:** Clear downside pressure\n"
+                    f"**1H Change:** {fmt_pct(ch1)}\n"
+                    f"**24H Change:** {fmt_pct(ch24)}\n\n"
+                    f"👉 **Take Action:** راقب الدعم — لا تستعجل",
+                    0xE67E22
                 )
 
             last_btc_eth_signals[coin_id] = signal
 
     except Exception as e:
-        print("BTC/ETH error:", e)
+        print("BTC/ETH error:", e, flush=True)
 
 # =========================
 # Daily Market Insight
@@ -321,26 +340,27 @@ def daily_market_insight():
         avg = ((btc.get("price_change_percentage_24h") or 0) + (eth.get("price_change_percentage_24h") or 0)) / 2
 
         if avg > 2:
-            state = "صعود"
+            state = "Bullish"
             action = "راقب — دخول تدريجي"
         elif avg < -2:
-            state = "هبوط"
+            state = "Bearish"
             action = "خليك كاش — انتظار"
         else:
-            state = "حيادي"
+            state = "Neutral"
             action = "مراقبة فقط"
 
-        send(
-            f"📊 **Market Insight**\n"
-            f"**اليوم:** السوق بحالة {state}\n"
-            f"👉 **الزبدة:** نظرة عامة يومية بسيطة على BTC و ETH\n"
-            f"👉 **Take Action:** {action}"
+        send_embed(
+            "📊 Market Insight",
+            f"**Today:** {state}\n"
+            f"**Focus:** BTC and ETH daily trend\n\n"
+            f"👉 **Take Action:** {action}",
+            0x3498DB
         )
 
         last_market_insight_date = today
 
     except Exception as e:
-        print("Insight error:", e)
+        print("Insight error:", e, flush=True)
 
 # =========================
 # Main bot loop
@@ -354,6 +374,6 @@ def run_bot():
             monitor_btc_eth()
             daily_market_insight()
         except Exception as e:
-            print("Main loop error:", e)
+            print("Main loop error:", e, flush=True)
 
         time.sleep(300)
