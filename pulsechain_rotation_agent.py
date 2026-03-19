@@ -1,18 +1,3 @@
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'OK')
-
-def run_server():
-    server = HTTPServer(('0.0.0.0', 8080), Handler)
-    server.serve_forever()
-
-threading.Thread(target=run_server, daemon=True).start()
-
 import re
 import time
 import html
@@ -25,23 +10,24 @@ import httpx
 # =========================================================
 # CONFIG
 # =========================================================
-DISCORD_WEBHOOK = "YOUR_NEW_WEBHOOK_HERE"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
 
-DEBUG = False
+DEBUG = True
 POLL_SECONDS = 300
 
-TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 45
-MACRO_ALERT_COOLDOWN_SECONDS = 60 * 45
-NEWS_ALERT_COOLDOWN_SECONDS = 60 * 90
+TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 20
+MACRO_ALERT_COOLDOWN_SECONDS = 60 * 25
+NEWS_ALERT_COOLDOWN_SECONDS = 60 * 60
 
 QUIET_HOURS_BETWEEN_SAME_NEWS = 6
 MIN_NEWS_SCORE = 5
 MIN_NEWS_PRICE_MOVE_FOR_ALERT = 1.25
+MACRO_CACHE_SECONDS = 600  # 10 minutes
 
 client = httpx.Client(
     timeout=20.0,
     follow_redirects=True,
-    headers={"User-Agent": "Mozilla/5.0 PulseChainRotationAgent/3.0"}
+    headers={"User-Agent": "Mozilla/5.0 PulseChainRotationAgent/4.0"}
 )
 
 # =========================================================
@@ -85,6 +71,16 @@ TOKENS = [
 ]
 
 # =========================================================
+# COLORS
+# =========================================================
+GREEN = 0x2ECC71
+RED = 0xE74C3C
+YELLOW = 0xF1C40F
+BLUE = 0x3498DB
+ORANGE = 0xE67E22
+PURPLE = 0x8E44AD
+
+# =========================================================
 # HELPERS
 # =========================================================
 def log(*args):
@@ -102,11 +98,6 @@ def safe_float(v, default=0.0):
         return float(v or 0)
     except Exception:
         return default
-
-def fmt_pct(v):
-    v = safe_float(v)
-    sign = "+" if v > 0 else ""
-    return f"{sign}{v:.2f}%"
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -154,7 +145,7 @@ def cleanup_seen_news():
         for k in old_keys:
             d.pop(k, None)
 
-def send_embed(title, description, color=0x8E44AD, url=None):
+def send_embed(title, description, color=PURPLE, url=None):
     embed = {
         "title": title,
         "description": description,
@@ -168,18 +159,9 @@ def send_embed(title, description, color=0x8E44AD, url=None):
     try:
         r = client.post(DISCORD_WEBHOOK, json=payload)
         r.raise_for_status()
+        print(f"[SEND] {title}", flush=True)
     except Exception as e:
         print("Webhook embed error:", e, flush=True)
-
-# =========================================================
-# COLORS
-# =========================================================
-GREEN = 0x2ECC71
-RED = 0xE74C3C
-YELLOW = 0xF1C40F
-BLUE = 0x3498DB
-ORANGE = 0xE67E22
-PURPLE = 0x8E44AD
 
 # =========================================================
 # DEXSCREENER
@@ -308,10 +290,15 @@ def fetch_token_market(search_term):
         return None
 
 # =========================================================
-# MACRO
+# MACRO CACHE
 # =========================================================
-def refresh_macro_market():
+def refresh_macro_market(force=False):
     global market_cache
+
+    if not force and (time.time() - market_cache.get("updated_at", 0)) < MACRO_CACHE_SECONDS:
+        log("Macro cache still fresh, skipping refresh")
+        return
+
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
@@ -328,6 +315,7 @@ def refresh_macro_market():
         eth = coin_map.get("ethereum")
 
         if not btc or not eth:
+            print("Macro refresh error: BTC or ETH missing", flush=True)
             return
 
         btc_1h = safe_float(btc.get("price_change_percentage_1h_in_currency"))
@@ -355,6 +343,9 @@ def refresh_macro_market():
             "eth_vol": safe_float(eth.get("total_volume")),
             "updated_at": time.time(),
         })
+
+        print("Macro market refreshed successfully", flush=True)
+
     except Exception as e:
         print("Macro refresh error:", e, flush=True)
 
@@ -374,7 +365,7 @@ def macro_alignment_bonus(token_market):
     return bonus
 
 # =========================================================
-# SHORT SMART TOKEN MESSAGES
+# TOKEN SIGNALS
 # =========================================================
 def derive_token_state(m):
     ratio = m["ratio_h1"]
@@ -408,7 +399,7 @@ def derive_token_state(m):
 
     return "neutral", "neutral", "خليك كاش — انتظار"
 
-def token_summary_line(symbol, state, m):
+def token_summary_line(symbol, state):
     if symbol == "PLS":
         if state in ("strong", "breakout", "dip_buy", "buildup"):
             return "🧠 السوق عم يجمع بولس"
@@ -432,7 +423,7 @@ def token_summary_line(symbol, state, m):
 
     return "🧠 السوق غير واضح"
 
-def token_reason_lines(m, state, mood):
+def token_reason_lines(m, mood):
     lines = []
 
     if mood == "bullish":
@@ -463,15 +454,14 @@ def token_reason_lines(m, state, mood):
         if market_cache.get("macro_bias") == "neutral":
             lines.append("🫥 السوق العام محايد")
 
-    # keep it short
     return lines[:3]
 
 def build_token_signal(symbol, label, m):
     state, mood, action_ar = derive_token_state(m)
     confidence = clamp(m["confidence"] + macro_alignment_bonus(m), 1, 10)
 
-    line1 = token_summary_line(symbol, state, m)
-    reason_lines = token_reason_lines(m, state, mood)
+    line1 = token_summary_line(symbol, state)
+    reason_lines = token_reason_lines(m, mood)
 
     if mood == "bullish":
         color = GREEN
@@ -516,13 +506,16 @@ def should_send_token_alert(symbol, state, mood, confidence, current_signal):
     if state == "neutral":
         return False
 
-    if state_changed and mood in ("bullish", "bearish"):
+    if previous_state == "neutral":
         return True
 
-    if signal_changed and confidence >= 7.0 and cooldown_ok:
+    if state_changed:
         return True
 
-    if state_changed and mood == "watch" and previous_state in ("neutral", "risk", "flush"):
+    if signal_changed and cooldown_ok and confidence >= 6.2:
+        return True
+
+    if cooldown_ok and mood in ("bullish", "bearish") and confidence >= 8.0:
         return True
 
     return False
@@ -535,6 +528,7 @@ def monitor_tokens():
         log(token["symbol"], "market =", market)
 
         if not market:
+            print(f"[TOKEN] {token['symbol']} no market data", flush=True)
             continue
 
         symbol = token["symbol"]
@@ -549,6 +543,13 @@ def monitor_tokens():
             f"{round(market['ratio_h1'],2)}|"
             f"{round(market['flow_score'],1)}|"
             f"{round(confidence,1)}"
+        )
+
+        print(f"[TOKEN] {symbol} state={state} mood={mood} confidence={confidence:.1f}", flush=True)
+        print(f"[TOKEN] {symbol} signal={current_signal}", flush=True)
+        print(
+            f"[TOKEN] {symbol} prev_state={last_token_states.get(symbol)} prev_signal={last_token_signals.get(symbol)}",
+            flush=True
         )
 
         if should_send_token_alert(symbol, state, mood, confidence, current_signal):
@@ -627,9 +628,6 @@ def monitor_btc_eth():
     global last_btc_eth_signals, last_macro_alert_time
 
     try:
-        if (time.time() - market_cache.get("updated_at", 0)) > 120:
-            refresh_macro_market()
-
         for coin_id, label in [("bitcoin", "₿ Bitcoin"), ("ethereum", "⟠ Ethereum")]:
             if coin_id == "bitcoin":
                 ch1 = market_cache["btc_1h"]
@@ -702,9 +700,6 @@ def daily_market_insight():
         return
 
     try:
-        if (time.time() - market_cache.get("updated_at", 0)) > 120:
-            refresh_macro_market()
-
         btc_24 = market_cache["btc_24h"]
         eth_24 = market_cache["eth_24h"]
         avg = (btc_24 + eth_24) / 2.0
@@ -931,9 +926,6 @@ def monitor_major_news():
         if not can_send_again(last_news_alert_time, NEWS_ALERT_COOLDOWN_SECONDS):
             return
 
-        if (time.time() - market_cache.get("updated_at", 0)) > 120:
-            refresh_macro_market()
-
         best = pick_best_news_event()
         if not best:
             return
@@ -979,6 +971,7 @@ def run_bot():
             monitor_btc_eth()
             daily_market_insight()
             monitor_major_news()
+            print("Loop completed successfully", flush=True)
         except Exception as e:
             print("Main loop error:", e, flush=True)
 
