@@ -185,6 +185,91 @@ class PulsechainRotationAgent:
     def signal_title_clean(self, signal):
         return f"{signal['symbol']} Coin"
 
+    def market_bias(self, pressure, price_1h, flow_score):
+        if flow_score >= 7 and pressure >= 1.2 and price_1h >= 0:
+            return "Bullish"
+        if flow_score <= 4 and pressure < 1:
+            return "Bearish"
+        return "Neutral"
+
+    def market_bias_ar(self, bias):
+        mapping = {
+            "Bullish": "صاعد",
+            "Bearish": "هابط",
+            "Neutral": "حيادي",
+        }
+        return mapping.get(bias, "حيادي")
+
+    def market_bias_emoji(self, bias):
+        mapping = {
+            "Bullish": "🔥",
+            "Bearish": "🔻",
+            "Neutral": "🟡",
+        }
+        return mapping.get(bias, "🟡")
+
+    def ratio_buy_score(self, pair):
+        if not pair:
+            return 0
+
+        vol_liq = self.volume_liq(pair)
+        pressure = self.pressure(pair)
+        price_1h = self.price_change_1h(pair)
+
+        score = 0.0
+
+        if vol_liq >= 1.5:
+            score += 4.0
+        elif vol_liq >= 1.0:
+            score += 3.0
+        elif vol_liq >= 0.7:
+            score += 2.0
+        elif vol_liq >= 0.3:
+            score += 1.0
+
+        if pressure >= 2.0:
+            score += 4.0
+        elif pressure >= 1.5:
+            score += 3.0
+        elif pressure >= 1.2:
+            score += 2.0
+        elif pressure >= 1.0:
+            score += 1.0
+
+        if price_1h >= 3:
+            score += 2.0
+        elif price_1h >= 0:
+            score += 1.0
+        elif price_1h < -2:
+            score -= 1.0
+
+        return max(0, min(10, round(score)))
+
+    def ratio_buy_label_ar(self, score):
+        if score >= 8:
+            return "فرصة شراء قوية"
+        if score >= 6:
+            return "مراقبة شراء"
+        if score >= 4:
+            return "محايد"
+        return "ضعيف للشراء"
+
+    def ratio_buy_emoji(self, score):
+        if score >= 8:
+            return "🟢"
+        if score >= 6:
+            return "🟡"
+        return "🔻"
+
+    def ratio_buy_read_ar(self, score, symbol):
+        if score >= 8:
+            return f"النسبة ممتازة على {symbol} والشراء يبدو مبرراً إذا جاء تأكيد."
+        if score >= 6:
+            return f"في بوادر فرصة على {symbol} لكن الأفضل انتظار تأكيد إضافي."
+        if score >= 4:
+            return f"الوضع على {symbol} متوسط — ليس سيئاً لكن ليس دخولاً واضحاً بعد."
+        return f"نسبة الشراء على {symbol} ضعيفة حالياً والأفضل عدم الاستعجال."
+
     def one_liner_market_read_ar(self, row):
         symbol = row["symbol"]
         pressure = row["pressure"]
@@ -355,28 +440,29 @@ class PulsechainRotationAgent:
         h = signal["price_1h"]
         lg = signal["liq_growth"]
         fscore = signal.get("flow_score", 0)
+        ratio_score = signal.get("ratio_buy_score", 0)
 
         if t == "SNIPER":
             if signal["grade"] == "A+":
-                return f"🔥 فرصة قوية — التدفق {fscore}/10 والزخم واضح والسيولة داعمة"
+                return f"🔥 فرصة قوية — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10 والزخم واضح."
             if p >= 2:
-                return f"💥 شراء واضح من السوق — التدفق {fscore}/10، ادخل بهدوء"
-            return f"✅ الاختراق تأكد — التدفق {fscore}/10"
+                return f"💥 شراء واضح من السوق — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
+            return f"✅ الاختراق تأكد — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
 
         if t == "WATCH":
             if p >= 1.8 and h < 0:
-                return f"👀 في تجميع محتمل — التدفق {fscore}/10، راقب التأكيد"
+                return f"👀 في تجميع محتمل — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
             if lg > 2:
-                return f"💧 السيولة عم تدخل — التدفق {fscore}/10، فرصة قادمة إذا السعر أكد"
-            return f"📊 راقبها عن قرب — التدفق {fscore}/10 ولسه بدها تأكيد"
+                return f"💧 السيولة عم تدخل — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
+            return f"📊 راقبها عن قرب — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
 
         if t == "EXTENDED":
-            return f"⚠️ انتبه — الحركة ممدودة حتى لو التدفق {fscore}/10، لا تلاحق"
+            return f"⚠️ انتبه — الحركة ممدودة حتى لو التدفق {fscore}/10، ونسبة الشراء الآن {ratio_score}/10."
 
         if t == "BRAIN":
-            return signal.get("action_ar", f"🧠 في حركة مهمّة بالسوق — التدفق {fscore}/10")
+            return signal.get("action_ar", f"🧠 في حركة مهمّة بالسوق — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10.")
 
-        return f"📈 راقب السوق — التدفق {fscore}/10"
+        return f"📈 راقب السوق — التدفق {fscore}/10 ونسبة الشراء {ratio_score}/10."
 
     # ---------------- SIGNAL ENGINE ----------------
 
@@ -395,6 +481,8 @@ class PulsechainRotationAgent:
             chart = self.get_chart_link(pair)
             flow = self.flow_read(symbol)
             flow_score = self.flow_score(symbol)
+            ratio_buy_score = self.ratio_buy_score(pair)
+            bias = self.market_bias(pressure, price_1h, flow_score)
         except Exception as e:
             print(f"[{symbol}] data error: {e}", flush=True)
             return None
@@ -413,8 +501,10 @@ class PulsechainRotationAgent:
                 "note_ar": "السيولة عم تتجمع على أصل أساسي وقد تسبق حركة أكبر",
                 "flow": flow,
                 "flow_score": flow_score,
+                "ratio_buy_score": ratio_buy_score,
+                "bias": bias,
                 "action": "🎯 Track closely / market may be preparing a bigger move",
-                "action_ar": f"🧠 انتبه — السيولة عم تتجمع، التدفق {flow_score}/10، ممكن حركة أكبر قادمة",
+                "action_ar": f"🧠 انتبه — السيولة عم تتجمع، التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -435,8 +525,10 @@ class PulsechainRotationAgent:
                 "note_ar": "الحركة ممدودة أكثر من اللازم — الأفضل عدم الملاحقة",
                 "flow": flow,
                 "flow_score": flow_score,
+                "ratio_buy_score": ratio_buy_score,
+                "bias": bias,
                 "action": "🎯 Wait for pullback / do not chase",
-                "action_ar": f"⚠️ خفف اندفاعك — التدفق {flow_score}/10 لكن الحركة ممدودة",
+                "action_ar": f"⚠️ خفف اندفاعك — التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -463,8 +555,10 @@ class PulsechainRotationAgent:
                 "note_ar": "اختراق مع توسع بالحجم — الزخم حاضر",
                 "flow": flow,
                 "flow_score": flow_score,
+                "ratio_buy_score": ratio_buy_score,
+                "bias": bias,
                 "action": "🎯 Momentum confirmed — consider entry",
-                "action_ar": f"🚀 الزخم متأكد — التدفق {flow_score}/10، ادخل بحذر وذكاء",
+                "action_ar": f"🚀 الزخم متأكد — التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -490,8 +584,10 @@ class PulsechainRotationAgent:
                 "note_ar": "التدفق يتحسن، لكن الاختراق لم يتأكد بالكامل بعد",
                 "flow": flow,
                 "flow_score": flow_score,
+                "ratio_buy_score": ratio_buy_score,
+                "bias": bias,
                 "action": "🎯 Watch for confirmation / 1H strength",
-                "action_ar": f"👀 راقب التأكيد وقوة الساعة — التدفق {flow_score}/10",
+                "action_ar": f"👀 راقب التأكيد وقوة الساعة — التدفق {flow_score}/10 ونسبة الشراء {ratio_buy_score}/10.",
                 "chart": chart,
                 "liquidity": liquidity,
                 "volume": volume,
@@ -526,6 +622,8 @@ class PulsechainRotationAgent:
             price_1h = self.price_change_1h(pair)
             liq_growth = self.liquidity_growth_pct(symbol)
             flow_score = self.flow_score(symbol)
+            ratio_buy_score = self.ratio_buy_score(pair)
+            bias = self.market_bias(pressure, price_1h, flow_score)
 
             score = (
                 (vol_liq * 30)
@@ -546,6 +644,8 @@ class PulsechainRotationAgent:
                 "flow": self.flow_read(symbol),
                 "flow_ar": self.flow_read_ar(symbol),
                 "flow_score": flow_score,
+                "ratio_buy_score": ratio_buy_score,
+                "bias": bias,
             })
 
         if not rows:
@@ -573,6 +673,13 @@ class PulsechainRotationAgent:
             flow_score = row["flow_score"]
             flow_score_icon = self.flow_score_emoji(flow_score)
             flow_score_label = self.flow_score_label_ar(flow_score)
+            ratio_buy_score = row["ratio_buy_score"]
+            ratio_buy_icon = self.ratio_buy_emoji(ratio_buy_score)
+            ratio_buy_label = self.ratio_buy_label_ar(ratio_buy_score)
+            ratio_buy_read = self.ratio_buy_read_ar(ratio_buy_score, row["symbol"])
+            bias = row["bias"]
+            bias_icon = self.market_bias_emoji(bias)
+            bias_ar = self.market_bias_ar(bias)
 
             value = (
                 f"{liq_icon} **Liquidity / السيولة**: {self.format_money(row['liq'])} ({row['liq_growth']:+.1f}%)\n"
@@ -580,9 +687,12 @@ class PulsechainRotationAgent:
                 f"{pressure_icon} **Pressure / القوة**: {row['pressure']:.2f}\n"
                 f"⏱️ **1H Move / حركة الساعة**: {row['price_1h']:+.2f}%\n"
                 f"{flow_score_icon} **Flow Score / تقييم التدفق**: {flow_score}/10 ({flow_score_label})\n"
+                f"{bias_icon} **Bias / التوجه**: {bias} / {bias_ar}\n"
+                f"{ratio_buy_icon} **Buy Ratio / نسبة الشراء**: {ratio_buy_score}/10 ({ratio_buy_label})\n"
                 f"🧭 **Flow / تدفق السيولة**: {row['flow']}\n"
                 f"🇸🇦 **التدفق**: {row['flow_ar']}\n"
                 f"📌 **الخلاصة**: {quick_read_ar}\n"
+                f"🛒 **قراءة الشراء**: {ratio_buy_read}\n"
                 f"{separator}"
             )
 
@@ -596,7 +706,7 @@ class PulsechainRotationAgent:
             "name": "🧠 قراءة السوق",
             "value": (
                 "إذا شفت تقييم التدفق عالي مع ضغط شراء وسيولة تتحسن، غالباً في حركة عم تنبني فعلياً. "
-                "أما إذا كان التقييم ضعيف أو متوسط، خليك مراقب أكثر من كونك مندفع."
+                "أما Buy Ratio فهو طبقة قرار إضافية: كلما ارتفع، صارت فكرة الشراء أقوى. إذا كان منخفض، خليك مراقب أكثر من كونك مندفع."
             ),
             "inline": False
         })
@@ -621,6 +731,13 @@ class PulsechainRotationAgent:
         fscore_icon = self.flow_score_emoji(fscore)
         fscore_label = self.flow_score_label_ar(fscore)
         symbol_ar = self.symbol_name_ar(signal["symbol"])
+        ratio_buy_score = signal.get("ratio_buy_score", 0)
+        ratio_buy_icon = self.ratio_buy_emoji(ratio_buy_score)
+        ratio_buy_label = self.ratio_buy_label_ar(ratio_buy_score)
+        ratio_buy_read = self.ratio_buy_read_ar(ratio_buy_score, signal["symbol"])
+        bias = signal.get("bias", self.market_bias(signal["pressure"], signal["price_1h"], fscore))
+        bias_icon = self.market_bias_emoji(bias)
+        bias_ar = self.market_bias_ar(bias)
 
         embed = {
             "title": self.signal_title_clean(signal),
@@ -636,8 +753,11 @@ class PulsechainRotationAgent:
                 {"name": "📈 1H / حركة الساعة", "value": f"{signal['price_1h']:+.2f}%", "inline": True},
                 {"name": "💧 Liquidity Δ / تغير السيولة", "value": f"{signal['liq_growth']:+.1f}%", "inline": True},
                 {"name": f"{fscore_icon} Flow Score / تقييم التدفق", "value": f"{fscore}/10 ({fscore_label})", "inline": True},
+                {"name": f"{bias_icon} Bias / التوجه", "value": f"{bias} / {bias_ar}", "inline": True},
+                {"name": f"{ratio_buy_icon} Buy Ratio / نسبة الشراء", "value": f"{ratio_buy_score}/10 ({ratio_buy_label})", "inline": True},
                 {"name": "🧭 Flow / تدفق السيولة", "value": f"{signal['flow']}\n{self.flow_read_ar(signal['symbol'])}", "inline": False},
                 {"name": "🧠 Insight / نظرة", "value": f"{signal['note']}\n{signal.get('note_ar', '')}\n\u200b\n\u200b", "inline": False},
+                {"name": "🛒 Buy Read / قراءة الشراء", "value": ratio_buy_read, "inline": False},
                 {"name": "🎯 Action / الإجراء", "value": f"{signal['action']}\n{action_ar}", "inline": False},
                 {"name": "🔗 Chart / الشارت", "value": signal["chart"], "inline": False},
             ],
