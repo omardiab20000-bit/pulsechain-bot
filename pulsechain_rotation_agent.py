@@ -4,6 +4,8 @@ import re
 import time
 import statistics
 import html
+import random
+from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse, unquote
 import xml.etree.ElementTree as ET
@@ -25,6 +27,7 @@ STATE_SAVE_SECONDS = 120
 TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 25
 ROTATION_ALERT_COOLDOWN_SECONDS = 60 * 45
 MACRO_ALERT_COOLDOWN_SECONDS = 60 * 60
+MARKET_REGIME_ALERT_COOLDOWN_SECONDS = 60 * 60 * 6
 
 SENTIMENT_TRIGGER_PRICE_PCT = 4.0
 SENTIMENT_TRIGGER_VOL_LIQ = 0.035
@@ -32,23 +35,32 @@ SENTIMENT_TRIGGER_LIQ_DELTA = 6.0
 SENTIMENT_MAX_NEWS_ITEMS = 5
 SENTIMENT_MAX_X_ITEMS = 5
 
+MARKET_REGIME_CACHE_SECONDS = 1800
+INSIGHT_MIN_SECONDS = 60 * 60
+INSIGHT_MAX_SECONDS = 60 * 90
+INSIGHT_HISTORY_SIZE = 12
+INSIGHT_BLOCK_AFTER_ALERT_SECONDS = 1800
+
 DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
 PULSESCAN_API = "https://api.scan.pulsechain.com/api"
 COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
+COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 DDG_HTML_SEARCH = "https://duckduckgo.com/html/"
+ALT_FEAR_GREED_URL = "https://api.alternative.me/fng/"
+BLOCKCHAINCENTER_ALTSEASON_URL = "https://www.blockchaincenter.net/altcoin-season-index/"
 
 DEBUG = True
 STATE_FILE = "pulsechain_rotation_state.json"
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-PUBLIC_MODE = "premium"
+PUBLIC_MODE = "premium-ar"
 BOT_NAME = "PulseChain Rotation Agent PRO"
 
 client = httpx.Client(
     timeout=httpx.Timeout(20.0, connect=10.0),
     follow_redirects=True,
-    headers={"User-Agent": "PulseChainRotationAgent/10.0"},
+    headers={"User-Agent": "PulseChainRotationAgent/11.0"},
 )
 
 # =========================================================
@@ -62,6 +74,7 @@ TOKENS = [
         "contract": "0xa1077a294dde1b09bb078844df40758a5d0f9a27",
         "news_query": '"PLS" PulseChain OR "PulseChain PLS"',
         "x_query": 'site:x.com ("PLS" "PulseChain" OR "PulseChain PLS")',
+        "arabic_name": "بولس",
     },
     {
         "symbol": "PLSX",
@@ -70,6 +83,7 @@ TOKENS = [
         "contract": "0x95b303987a60c71504d99aa1b13b4da07b0790ab",
         "news_query": '"PLSX" PulseChain OR "PulseX"',
         "x_query": 'site:x.com ("PLSX" OR "PulseX") PulseChain',
+        "arabic_name": "بولس اكس",
     },
     {
         "symbol": "PRVX",
@@ -78,6 +92,7 @@ TOKENS = [
         "contract": "0xF6f8Db0aBa00007681F8fAF16A0FDa1c9B030b11",
         "news_query": '"PRVX" PulseChain OR "Provex" OR "ProveX"',
         "x_query": 'site:x.com ("PRVX" OR "Provex" OR "ProveX") PulseChain',
+        "arabic_name": "PRVX",
     },
 ]
 
@@ -125,6 +140,9 @@ last_rotation_alert_time = 0
 last_macro_signal = None
 last_macro_alert_time = 0
 
+last_market_regime_state = None
+last_market_regime_alert_time = 0
+
 market_cache = {
     "bias": "neutral",
     "btc_24h": 0.0,
@@ -132,9 +150,27 @@ market_cache = {
     "updated_at": 0.0,
 }
 
+market_regime_cache = {
+    "updated_at": 0.0,
+    "fear_value": None,
+    "fear_label": None,
+    "btc_dominance": None,
+    "eth_dominance": None,
+    "altseason_index": None,
+    "regime": "unknown",
+    "summary": "السوق غير واضح",
+    "title": "🌍 حالة السوق — غير واضحة",
+    "bullets": [],
+    "action": "راقب فقط",
+}
+
 latest_token_market = {}
 last_liquidity_by_symbol = {}
 last_state_save_ts = 0.0
+last_any_alert_time = 0.0
+last_insight_time = 0.0
+next_insight_after = random.randint(INSIGHT_MIN_SECONDS, INSIGHT_MAX_SECONDS)
+recent_insights = deque(maxlen=INSIGHT_HISTORY_SIZE)
 
 scan_cache = {
     t["symbol"]: {
@@ -154,7 +190,7 @@ sentiment_cache = {
         "updated_at": 0.0,
         "sentiment_score": 0.0,
         "mood": "quiet",
-        "summary": "No clear social confirmation",
+        "summary": "لا يوجد تأكيد اجتماعي واضح",
         "bullish_hits": 0,
         "bearish_hits": 0,
         "news_hits": 0,
@@ -178,7 +214,9 @@ def log(*args):
 
 def safe_float(v, default=0.0):
     try:
-        return float(v or 0)
+        if v is None:
+            return default
+        return float(v)
     except Exception:
         return default
 
@@ -237,26 +275,39 @@ def ensure_symbol_dict(base, default_value):
 
 def confidence_from_score(score):
     if score >= 8.2:
-        return "High"
+        return "عالية"
     if score >= 6.2:
-        return "Medium"
-    return "Low"
+        return "متوسطة"
+    return "منخفضة"
 
 
 def market_context_label():
+    regime = market_regime_cache.get("regime", "unknown")
+
+    if regime in ("altseason_active", "altseason_building"):
+        return "داعم للألتات"
+    if regime in ("btc_dominant", "fear_defensive"):
+        return "حذر / دفاعي"
+    if regime == "greed_hot":
+        return "قوي لكن حار"
+    if regime == "patience_range":
+        return "انتظار وصبر"
+    if regime == "transition":
+        return "مرحلة انتقال"
     bias = market_cache.get("bias", "neutral")
     if bias == "bullish":
-        return "Supportive"
+        return "مساعد"
     if bias == "bearish":
-        return "Cautious"
-    return "Mixed"
+        return "حذر"
+    return "مختلط"
 
 
 def format_public_embed(title, sections, color=PURPLE, url=None):
     description_lines = []
     for line in sections:
-        if line:
-            description_lines.append(line)
+        if line is None:
+            continue
+        description_lines.append(line)
 
     embed = {
         "title": title,
@@ -270,6 +321,8 @@ def format_public_embed(title, sections, color=PURPLE, url=None):
 
 
 def send_embed_obj(embed):
+    global last_any_alert_time
+
     if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
         print("Webhook not set correctly.", flush=True)
         return
@@ -279,6 +332,7 @@ def send_embed_obj(embed):
     try:
         r = client.post(DISCORD_WEBHOOK, json=payload)
         r.raise_for_status()
+        last_any_alert_time = time.time()
         print(f"[SEND] {embed.get('title')}", flush=True)
     except Exception as e:
         print("Webhook error:", e, flush=True)
@@ -287,6 +341,21 @@ def send_embed_obj(embed):
 def send_embed(title, description, color=PURPLE, url=None):
     embed = format_public_embed(title, [description], color=color, url=url)
     send_embed_obj(embed)
+
+
+def token_name_ar(symbol):
+    for t in TOKENS:
+        if t["symbol"] == symbol:
+            return t.get("arabic_name", symbol)
+    return symbol
+
+
+def regime_is_alt_friendly():
+    return market_regime_cache.get("regime") in ("altseason_building", "altseason_active")
+
+
+def regime_is_cautious():
+    return market_regime_cache.get("regime") in ("btc_dominant", "fear_defensive")
 
 
 def save_state(force=False):
@@ -303,11 +372,18 @@ def save_state(force=False):
         "last_rotation_alert_time": last_rotation_alert_time,
         "last_macro_signal": last_macro_signal,
         "last_macro_alert_time": last_macro_alert_time,
+        "last_market_regime_state": last_market_regime_state,
+        "last_market_regime_alert_time": last_market_regime_alert_time,
         "market_cache": market_cache,
+        "market_regime_cache": market_regime_cache,
         "last_liquidity_by_symbol": last_liquidity_by_symbol,
         "scan_cache": scan_cache,
         "sentiment_cache": sentiment_cache,
         "scan_cursor": scan_cursor,
+        "last_any_alert_time": last_any_alert_time,
+        "last_insight_time": last_insight_time,
+        "next_insight_after": next_insight_after,
+        "recent_insights": list(recent_insights),
     }
 
     try:
@@ -321,7 +397,9 @@ def save_state(force=False):
 def load_state():
     global last_rotation_state, last_rotation_alert_time
     global last_macro_signal, last_macro_alert_time
+    global last_market_regime_state, last_market_regime_alert_time
     global scan_cursor
+    global last_any_alert_time, last_insight_time, next_insight_after
 
     if not os.path.exists(STATE_FILE):
         return
@@ -334,13 +412,18 @@ def load_state():
         last_token_signals.update(ensure_symbol_dict(data.get("last_token_signals", {}), None))
         last_token_alert_time.update(ensure_symbol_dict(data.get("last_token_alert_time", {}), 0))
 
-        globals()["last_rotation_state"] = data.get("last_rotation_state")
-        globals()["last_rotation_alert_time"] = safe_float(data.get("last_rotation_alert_time"), 0.0)
-        globals()["last_macro_signal"] = data.get("last_macro_signal")
-        globals()["last_macro_alert_time"] = safe_float(data.get("last_macro_alert_time"), 0.0)
+        last_rotation_state = data.get("last_rotation_state")
+        last_rotation_alert_time = safe_float(data.get("last_rotation_alert_time"), 0.0)
+        last_macro_signal = data.get("last_macro_signal")
+        last_macro_alert_time = safe_float(data.get("last_macro_alert_time"), 0.0)
+        last_market_regime_state = data.get("last_market_regime_state")
+        last_market_regime_alert_time = safe_float(data.get("last_market_regime_alert_time"), 0.0)
 
         if isinstance(data.get("market_cache"), dict):
             market_cache.update(data["market_cache"])
+
+        if isinstance(data.get("market_regime_cache"), dict):
+            market_regime_cache.update(data["market_regime_cache"])
 
         if isinstance(data.get("last_liquidity_by_symbol"), dict):
             last_liquidity_by_symbol.update(data["last_liquidity_by_symbol"])
@@ -356,6 +439,14 @@ def load_state():
                     sentiment_cache[symbol].update(data["sentiment_cache"][symbol])
 
         scan_cursor = safe_int(data.get("scan_cursor"), 0)
+        last_any_alert_time = safe_float(data.get("last_any_alert_time"), 0.0)
+        last_insight_time = safe_float(data.get("last_insight_time"), 0.0)
+        next_insight_after = safe_int(data.get("next_insight_after"), random.randint(INSIGHT_MIN_SECONDS, INSIGHT_MAX_SECONDS))
+
+        recent_insights.clear()
+        for item in data.get("recent_insights", []):
+            recent_insights.append(item)
+
         print("State loaded", flush=True)
     except Exception as e:
         print("State load error:", e, flush=True)
@@ -374,6 +465,273 @@ def get_text(url, params=None, timeout=10.0):
     r = client.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.text
+
+
+# =========================================================
+# MARKET REGIME ENGINE
+# =========================================================
+def fetch_global_dominance():
+    try:
+        data = get_json(COINGECKO_GLOBAL_URL, timeout=12.0)
+        inner = data.get("data") or {}
+        mcp = inner.get("market_cap_percentage") or {}
+
+        return {
+            "btc_dominance": safe_float(mcp.get("btc"), None),
+            "eth_dominance": safe_float(mcp.get("eth"), None),
+        }
+    except Exception as e:
+        print("Global dominance fetch error:", e, flush=True)
+        return None
+
+
+def fetch_fear_greed():
+    try:
+        data = get_json(ALT_FEAR_GREED_URL, params={"limit": 1}, timeout=12.0)
+        rows = data.get("data") or []
+        if not rows:
+            return None
+
+        row = rows[0]
+        return {
+            "fear_value": safe_int(row.get("value"), None),
+            "fear_label": (row.get("value_classification") or "").strip(),
+        }
+    except Exception as e:
+        print("Fear & Greed fetch error:", e, flush=True)
+        return None
+
+
+def fetch_altseason_index():
+    try:
+        html_text = get_text(BLOCKCHAINCENTER_ALTSEASON_URL, timeout=12.0)
+
+        m = re.search(r"Altcoin Season\s*\((\d{1,3})\)", html_text, re.IGNORECASE)
+        if not m:
+            m = re.search(r'Altcoin Season Index.*?(\d{1,3})', html_text, re.IGNORECASE | re.DOTALL)
+
+        if not m:
+            return None
+
+        value = safe_int(m.group(1), None)
+        if value is None:
+            return None
+
+        return {"altseason_index": value}
+    except Exception as e:
+        print("Altseason fetch error:", e, flush=True)
+        return None
+
+
+def classify_fear_zone(value):
+    if value is None:
+        return "unknown"
+    if value <= 24:
+        return "extreme_fear"
+    if value <= 44:
+        return "fear"
+    if value <= 55:
+        return "neutral"
+    if value <= 74:
+        return "greed"
+    return "extreme_greed"
+
+
+def derive_market_regime(fear_value, btc_d, eth_d, alt_idx):
+    fear_zone = classify_fear_zone(fear_value)
+
+    if btc_d is None or alt_idx is None:
+        return {
+            "regime": "unknown",
+            "summary": "السوق غير واضح بالكامل بعد",
+            "title": "🌍 حالة السوق — غير واضحة",
+            "bullets": [
+                "🫥 البيانات غير مكتملة حاليًا",
+                "⏳ البوت بانتظار صورة أوضح",
+                "🧠 الأفضل عدم بناء رأي كبير الآن",
+            ],
+            "action": "راقب فقط",
+        }
+
+    if alt_idx >= 75 and btc_d <= 54.5:
+        return {
+            "regime": "altseason_active",
+            "summary": "موسم الألتات فعّال",
+            "title": "🚀 حالة السوق — موسم ألتات فعلي",
+            "bullets": [
+                "🧠 السوق صار يعطي مساحة أوسع للألتات",
+                "📈 الحركة ما عادت محصورة بالبيتكوين",
+                "⚡ شهية المخاطرة واضحة",
+            ],
+            "action": "ركّز على الألتات القوية، لكن بدون طمع",
+        }
+
+    if alt_idx >= 55 and btc_d <= 57.5:
+        return {
+            "regime": "altseason_building",
+            "summary": "بوادر موسم ألتات",
+            "title": "👀 حالة السوق — بوادر موسم ألتات",
+            "bullets": [
+                "🌱 الألتات بدأت تبين تحسن أوسع",
+                "🧠 هيمنة البيتكوين مو بنفس القوة السابقة",
+                "⏳ السوق عم يجهّز نفسه لكنه مو محسوم بعد",
+            ],
+            "action": "راقب الألتات القوية من الآن",
+        }
+
+    if fear_zone in ("extreme_fear", "fear") and btc_d >= 57.0:
+        return {
+            "regime": "fear_defensive",
+            "summary": "السوق دفاعي وخائف",
+            "title": "😨 حالة السوق — خوف واضح",
+            "bullets": [
+                "📉 السوق تحت ضغط نفسي ومالي",
+                "🧠 المشاركين صاروا أكثر دفاعية",
+                "⚖️ البيتكوين ما زالت تمثل الملجأ الأقوى نسبيًا",
+            ],
+            "action": "خفف الاندفاع وراقب بهدوء",
+        }
+
+    if fear_zone in ("greed", "extreme_greed") and alt_idx >= 60:
+        return {
+            "regime": "greed_hot",
+            "summary": "السوق حار والطمع مرتفع",
+            "title": "🔥 حالة السوق — طمع عالي",
+            "bullets": [
+                "📈 الحركة صارت أسرع من الراحة",
+                "🧠 السوق داخل مزاج اندفاع واضح",
+                "⚠️ هون تبدأ أخطاء المطاردة عادةً",
+            ],
+            "action": "استفد من القوة لكن لا تطارد",
+        }
+
+    if btc_d >= 58.0 and alt_idx <= 45:
+        return {
+            "regime": "btc_dominant",
+            "summary": "البيتكوين ما زالت مسيطرة",
+            "title": "🌍 حالة السوق — سيطرة بيتكوين",
+            "bullets": [
+                "🧠 السيولة ما زالت متمركزة حول البيتكوين",
+                "📉 الألتات ما عندها انتشار كافي بعد",
+                "⚖️ السوق يفضل الأمان أكثر من المخاطرة",
+            ],
+            "action": "الألتات تحتاج انتقائية عالية",
+        }
+
+    if 45 <= alt_idx <= 55 and 45 <= (fear_value or 50) <= 60:
+        return {
+            "regime": "patience_range",
+            "summary": "السوق بمرحلة صبر",
+            "title": "🧊 حالة السوق — مرحلة صبر",
+            "bullets": [
+                "🫥 لا خوف قوي ولا طمع قوي",
+                "⚖️ السوق داخل مرحلة انتظار",
+                "⏳ الحركة العامة لا تعطي أفضلية كبيرة لأي جهة",
+            ],
+            "action": "أفضل قرار: لا تجبر صفقة",
+        }
+
+    return {
+        "regime": "transition",
+        "summary": "السوق داخل مرحلة انتقال",
+        "title": "🔄 حالة السوق — انتقال",
+        "bullets": [
+            "🧠 في تغير تدريجي بالصورة العامة",
+            "👀 بعض الإشارات تتحسن لكن المشهد مو مكتمل",
+            "⏳ المرحلة الحالية تحتاج صبر ومراقبة",
+        ],
+        "action": "راقب ولا تتسرع",
+    }
+
+
+def refresh_market_regime():
+    if (time.time() - market_regime_cache.get("updated_at", 0)) < MARKET_REGIME_CACHE_SECONDS:
+        return market_regime_cache
+
+    dom = fetch_global_dominance()
+    fng = fetch_fear_greed()
+    alt = fetch_altseason_index()
+
+    btc_d = dom.get("btc_dominance") if dom else None
+    eth_d = dom.get("eth_dominance") if dom else None
+    fear_value = fng.get("fear_value") if fng else None
+    fear_label = fng.get("fear_label") if fng else None
+    alt_idx = alt.get("altseason_index") if alt else None
+
+    regime = derive_market_regime(fear_value, btc_d, eth_d, alt_idx)
+
+    market_regime_cache.update({
+        "updated_at": time.time(),
+        "fear_value": fear_value,
+        "fear_label": fear_label,
+        "btc_dominance": btc_d,
+        "eth_dominance": eth_d,
+        "altseason_index": alt_idx,
+        "regime": regime["regime"],
+        "summary": regime["summary"],
+        "title": regime["title"],
+        "bullets": regime["bullets"],
+        "action": regime["action"],
+    })
+
+    print(
+        f"[REGIME] regime={market_regime_cache['regime']} "
+        f"fear={fear_value} btc.d={btc_d} eth.d={eth_d} alt={alt_idx}",
+        flush=True
+    )
+    return market_regime_cache
+
+
+def build_market_regime_embed(cache):
+    sections = [f"- {x}" for x in cache.get("bullets", [])]
+    sections.append("")
+    sections.append(f"👉 **الخلاصة:** {cache.get('action', 'راقب فقط')}")
+
+    color = BLUE
+    regime = cache.get("regime")
+
+    if regime in ("altseason_active", "altseason_building"):
+        color = GREEN
+    elif regime in ("fear_defensive", "btc_dominant"):
+        color = RED
+    elif regime in ("greed_hot",):
+        color = YELLOW
+    elif regime in ("patience_range",):
+        color = PURPLE
+
+    return {
+        "title": cache.get("title", "🌍 حالة السوق"),
+        "description": "\n".join(sections),
+        "color": color,
+        "footer": {"text": f"{BOT_NAME} • {footer_stamp()}"},
+    }
+
+
+def monitor_market_regime():
+    global last_market_regime_state, last_market_regime_alert_time
+
+    cache = refresh_market_regime()
+    current_state = cache.get("regime", "unknown")
+
+    if current_state == "unknown":
+        return
+
+    cooldown_ok = can_send_again(last_market_regime_alert_time, MARKET_REGIME_ALERT_COOLDOWN_SECONDS)
+
+    should_send = False
+    if last_market_regime_state is None:
+        should_send = True
+    elif current_state != last_market_regime_state:
+        should_send = True
+    elif cooldown_ok and current_state in ("altseason_building", "altseason_active", "fear_defensive"):
+        should_send = True
+
+    if not should_send:
+        return
+
+    send_embed_obj(build_market_regime_embed(cache))
+    last_market_regime_state = current_state
+    last_market_regime_alert_time = time.time()
 
 
 # =========================================================
@@ -871,14 +1229,14 @@ def should_refresh_sentiment(symbol, market):
 
 def summarize_sentiment(score, bull, bear, catalysts, news_count, x_count):
     if news_count == 0 and x_count == 0:
-        return "No clear social confirmation", "quiet"
+        return "لا يوجد تأكيد اجتماعي واضح", "quiet"
     if score >= 3.5 or (bull >= bear + 3 and catalysts >= 1):
-        return "Narrative flow is supportive", "positive"
+        return "الضجة الحالية داعمة", "positive"
     if score <= -3.5 or (bear >= bull + 3):
-        return "Social tone is leaning negative", "negative"
+        return "الضجة الحالية ضد الحركة", "negative"
     if catalysts >= 2 and bull >= bear:
-        return "Catalyst present, confirmation moderate", "catalyst"
-    return "Mixed flow, not decisive yet", "mixed"
+        return "في catalyst لكن التأكيد متوسط", "catalyst"
+    return "الإشارات الاجتماعية مختلطة", "mixed"
 
 
 def refresh_sentiment_for_token(token, market):
@@ -970,6 +1328,8 @@ def build_market_snapshot(token):
     accumulation_score += liq_stats["lp_add_hint"] * 0.5
     if sentiment["mood"] in ("positive", "catalyst"):
         accumulation_score += 0.5
+    if regime_is_alt_friendly():
+        accumulation_score += 0.5
     accumulation_score = clamp(accumulation_score, 0, 10)
 
     sell_pressure = 0.0
@@ -986,6 +1346,8 @@ def build_market_snapshot(token):
     sell_pressure += liq_stats["lp_remove_hint"] * 0.6
     if sentiment["mood"] == "negative":
         sell_pressure += 0.6
+    if regime_is_cautious():
+        sell_pressure += 0.6
     sell_pressure = clamp(sell_pressure, 0, 10)
 
     setup_quality = 0.0
@@ -998,6 +1360,10 @@ def build_market_snapshot(token):
         setup_quality += 0.6
     elif market_cache.get("bias") == "bearish":
         setup_quality -= 0.6
+    if regime_is_alt_friendly():
+        setup_quality += 0.5
+    if regime_is_cautious():
+        setup_quality -= 0.5
     setup_quality = clamp(setup_quality, 0, 10)
 
     risk_score = 0.0
@@ -1009,6 +1375,8 @@ def build_market_snapshot(token):
         risk_score += 0.8
     if market_cache.get("bias") == "bearish":
         risk_score += 0.8
+    if regime_is_cautious():
+        risk_score += 0.7
     risk_score = clamp(risk_score, 0, 10)
 
     merged = {}
@@ -1027,39 +1395,40 @@ def build_market_snapshot(token):
 # =========================================================
 # PREMIUM SIGNAL ENGINE
 # =========================================================
-def build_reasons(m):
+def build_reasons(symbol, m):
     reasons = []
+    token_ar = token_name_ar(symbol)
 
     if m["ratio_h1"] >= 1.18:
-        reasons.append("Buyers are maintaining control")
+        reasons.append("📈 المشترين ما زالوا أقوى")
     elif m["ratio_h1"] <= 0.95:
-        reasons.append("Sellers are still leading flow")
+        reasons.append("📉 البائعين ما زالوا أضغط")
 
     if m["h1_change"] < 0 and m["ratio_h1"] >= 1.10:
-        reasons.append("Weakness is being absorbed")
+        reasons.append("🛡️ الهبوط عم ينشفط")
     elif m["h6_change"] > 0 and m["ratio_h1"] >= 1.05:
-        reasons.append("Short-term momentum is improving")
+        reasons.append(f"⚡ الحركة على {token_ar} عم تتحسن")
     elif m["h6_change"] <= -6:
-        reasons.append("Pressure is still visible across the last few hours")
+        reasons.append("🌧️ الضغط ما زال واضح")
 
     if m["liq_delta_pct"] >= 6:
-        reasons.append("Liquidity conditions are improving")
+        reasons.append("💧 السيولة عم تتحسن")
     elif m["liq_delta_pct"] <= -6:
-        reasons.append("Liquidity is pulling back")
+        reasons.append("💨 السيولة عم تنسحب")
 
     sentiment = m.get("sentiment") or {}
     mood = sentiment.get("mood", "quiet")
     if mood in ("positive", "catalyst"):
-        reasons.append("Narrative flow is supportive")
+        reasons.append("📰 الضجة داعمة")
     elif mood == "negative":
-        reasons.append("Narrative flow is working against the move")
+        reasons.append("📰 الضجة ضد الحركة")
     elif mood == "mixed":
-        reasons.append("Social confirmation is still mixed")
+        reasons.append("📰 الأخبار مختلطة")
 
-    if market_cache.get("bias") == "bullish":
-        reasons.append("Macro backdrop is supportive")
-    elif market_cache.get("bias") == "bearish":
-        reasons.append("Macro backdrop is not helping")
+    if regime_is_alt_friendly():
+        reasons.append("🌱 جو السوق صار مساعد أكثر للألتات")
+    elif regime_is_cautious():
+        reasons.append("⚠️ جو السوق الحالي يحتاج حذر")
 
     deduped = []
     for r in reasons:
@@ -1076,15 +1445,11 @@ def derive_token_signal(symbol, m):
     accumulation = m["accumulation_score"]
     risk_score = m["risk_score"]
     setup_quality = m["setup_quality"]
-    whale = m["whale_pressure"]
     sentiment = m.get("sentiment") or {}
     sentiment_mood = sentiment.get("mood", "quiet")
-    macro_bias = market_cache.get("bias", "neutral")
 
     alert_type = None
-    bias = "Neutral"
-    confidence = "Low"
-    action = "Stay patient."
+    action = "راقب فقط."
     state = "neutral"
     color = GREY
 
@@ -1099,46 +1464,37 @@ def derive_token_signal(symbol, m):
         return {
             "state": "neutral",
             "alert_type": None,
-            "bias": "Neutral",
-            "confidence": "Low",
-            "action": "No clear edge.",
+            "confidence": "منخفضة",
+            "action": "لا يوجد edge واضح.",
             "color": GREY,
             "reasons": [],
-            "summary": "No clean signal",
+            "summary": "لا يوجد signal نظيف",
         }
 
     # Risk first
     if risk_score >= 7.3 and ratio < 0.98:
-        alert_type = "Risk Rising"
-        bias = "Bearish"
-        confidence = confidence_from_score(risk_score)
-        action = "Avoid aggressive entries."
+        alert_type = "ضغط بيع"
+        action = "خفف الاندفاع وتجنب الدخول القوي."
         state = "risk"
         color = RED
 
     elif risk_score >= 8.3 and h1 <= -7 and ratio < 0.95:
-        alert_type = "Breakdown Risk"
-        bias = "Bearish"
-        confidence = "High"
-        action = "Stand aside until pressure cools."
+        alert_type = "خطر متزايد"
+        action = "الأفضل الوقوف جانبًا حتى يهدأ الضغط."
         state = "risk"
         color = RED
 
-    # Strong actionable entry style
     elif (
         setup_quality >= 8.1
         and accumulation >= 6.3
         and ratio >= 1.15
         and risk_score <= 5.8
     ):
-        alert_type = "Actionable Entry"
-        bias = "Bullish"
-        confidence = confidence_from_score(setup_quality)
-        action = "Watch for gradual entry. Do not chase spikes."
+        alert_type = "دخول تدريجي"
+        action = "راقب دخول تدريجي، لكن بدون مطاردة."
         state = "entry"
         color = GREEN
 
-    # Dip watch
     elif (
         setup_quality >= 6.6
         and accumulation >= 5.8
@@ -1146,42 +1502,25 @@ def derive_token_signal(symbol, m):
         and h1 < 0
         and risk_score <= 6.2
     ):
-        alert_type = "Dip Watch"
-        bias = "Bullish"
-        confidence = confidence_from_score(setup_quality)
-        action = "Monitor for confirmation before sizing in."
+        alert_type = "مراقبة ذكية"
+        action = "راقب التأكيد قبل ما تكبّر الدخول."
         state = "watch"
         color = YELLOW
 
-    # Strength building
     elif (
         setup_quality >= 6.7
         and accumulation >= 5.9
         and ratio >= 1.10
         and h6 > -2.5
     ):
-        alert_type = "Strength Building"
-        bias = "Bullish"
-        confidence = confidence_from_score(setup_quality)
-        action = "Keep it on watch for continuation."
+        alert_type = "إشارة قوة"
+        action = "خليه على الرادار لاحتمال استمرار الحركة."
         state = "strength"
         color = GREEN
 
-    # Macro caution override
-    elif macro_bias == "bearish" and setup_quality >= 6.3 and h1 <= 0:
-        alert_type = "Watchlist Only"
-        bias = "Cautious"
-        confidence = confidence_from_score(setup_quality)
-        action = "Interesting setup, but macro is not helping."
-        state = "watch"
-        color = YELLOW
-
-    # Narrative strength but not enough
     elif sentiment_mood in ("positive", "catalyst") and setup_quality >= 5.9:
-        alert_type = "Watchlist Only"
-        bias = "Constructive"
-        confidence = "Low"
-        action = "Narrative is improving, but price structure still needs proof."
+        alert_type = "مراقبة"
+        action = "في تحسن بالنبرة، لكن السعر لسا بده إثبات."
         state = "watch"
         color = YELLOW
 
@@ -1189,26 +1528,24 @@ def derive_token_signal(symbol, m):
         return {
             "state": "neutral",
             "alert_type": None,
-            "bias": "Neutral",
-            "confidence": "Low",
-            "action": "No clear edge.",
+            "confidence": "منخفضة",
+            "action": "لا يوجد edge واضح.",
             "color": GREY,
             "reasons": [],
-            "summary": "No clean signal",
+            "summary": "لا يوجد signal نظيف",
         }
 
-    reasons = build_reasons(m)
-    summary = f"{symbol} is showing a clearer setup."
+    confidence = confidence_from_score(setup_quality if state != "risk" else risk_score)
+    reasons = build_reasons(symbol, m)
 
     return {
         "state": state,
         "alert_type": alert_type,
-        "bias": bias,
         "confidence": confidence,
         "action": action,
         "color": color,
         "reasons": reasons,
-        "summary": summary,
+        "summary": f"{symbol} عنده setup أوضح",
     }
 
 
@@ -1231,19 +1568,18 @@ def should_send_token_alert(symbol, signal_key, state):
 def build_token_embed(token, market, signal):
     title = f"{token['label']} — {signal['alert_type']}"
     sections = [
-        f"**Bias:** {signal['bias']}",
-        f"**Confidence:** {signal['confidence']}",
-        f"**Market Context:** {market_context_label()}",
+        f"**الثقة:** {signal['confidence']}",
+        f"**حالة السوق:** {market_context_label()}",
         "",
     ]
 
     for reason in signal["reasons"][:3]:
-        sections.append(f"• {reason}")
+        sections.append(f"{reason}")
 
     if signal["reasons"]:
         sections.append("")
 
-    sections.append(f"**Action:** {signal['action']}")
+    sections.append(f"👉 **الإجراء:** {signal['action']}")
 
     embed = format_public_embed(
         title=title,
@@ -1271,7 +1607,7 @@ def monitor_tokens():
 
         sentiment = market.get("sentiment") or {}
         signal_key = (
-            f"{signal['state']}|{signal['alert_type']}|{signal['bias']}|{signal['confidence']}|"
+            f"{signal['state']}|{signal['alert_type']}|{signal['confidence']}|"
             f"{round(market['ratio_h1'], 2)}|"
             f"{round(market['h1_change'], 1)}|"
             f"{round(market['h6_change'], 1)}|"
@@ -1282,7 +1618,8 @@ def monitor_tokens():
             f"{round(market['risk_score'], 1)}|"
             f"{round(market['liq_delta_pct'], 1)}|"
             f"{sentiment.get('mood', 'quiet')}|"
-            f"{round(safe_float(sentiment.get('sentiment_score'), 0.0), 1)}"
+            f"{round(safe_float(sentiment.get('sentiment_score'), 0.0), 1)}|"
+            f"{market_regime_cache.get('regime', 'unknown')}"
         )
 
         log(
@@ -1294,9 +1631,9 @@ def monitor_tokens():
             f"setup={round(market['setup_quality'],1)}",
             f"risk={round(market['risk_score'],1)}",
             f"accum={round(market['accumulation_score'],1)}",
-            f"whale={round(market['whale_pressure'],1)}",
             f"liqΔ={round(market['liq_delta_pct'],1)}",
             f"sent={sentiment.get('mood','quiet')}/{round(safe_float(sentiment.get('sentiment_score'),0.0),1)}",
+            f"regime={market_regime_cache.get('regime', 'unknown')}",
         )
 
         if not should_send_token_alert(symbol, signal_key, signal["state"]):
@@ -1345,35 +1682,33 @@ def detect_rotation():
     diff = plsx_strength - pls_strength
 
     if diff >= 2.2 and plsx["ratio_h1"] >= 1.10:
-        strength = "High" if diff >= 3.2 else "Medium"
+        strength = "قوية" if diff >= 3.2 else "متوسطة"
         return {
             "state": "to_plsx",
-            "title": "🔄 Rotation Shift",
+            "title": "🔄 Rotation — نحو PLSX",
             "sections": [
-                "**Flow:** PLS → PLSX",
-                f"**Strength:** {strength}",
+                f"**القوة:** {strength}",
                 "",
-                "• Relative strength is leaning toward PLSX",
-                "• Capital flow appears to be favoring PLSX",
+                "🧠 في انتقال سيولة باتجاه بولس اكس",
+                "⚡ بولس اكس عم تبين أقوى من بولس",
                 "",
-                "**Action:** Keep PLSX on closer watch than PLS.",
+                "👉 **الإجراء:** راقب PLSX أكثر من PLS",
             ],
             "color": BLUE,
         }
 
     if diff <= -2.2 and pls["ratio_h1"] >= 1.10:
-        strength = "High" if abs(diff) >= 3.2 else "Medium"
+        strength = "قوية" if abs(diff) >= 3.2 else "متوسطة"
         return {
             "state": "to_pls",
-            "title": "🔄 Rotation Shift",
+            "title": "🔄 Rotation — نحو PLS",
             "sections": [
-                "**Flow:** PLSX → PLS",
-                f"**Strength:** {strength}",
+                f"**القوة:** {strength}",
                 "",
-                "• Relative strength is leaning toward PLS",
-                "• Capital flow appears to be favoring PLS",
+                "🧠 في انتقال سيولة باتجاه بولس",
+                "⚡ بولس عم تبين أقوى من بولس اكس",
                 "",
-                "**Action:** Keep PLS on closer watch than PLSX.",
+                "👉 **الإجراء:** راقب PLS أكثر من PLSX",
             ],
             "color": BLUE,
         }
@@ -1419,29 +1754,23 @@ def monitor_macro():
 
     if bias == "bullish":
         embed = format_public_embed(
-            title="🌍 Macro Environment",
+            title="🌍 Macro — جو عام إيجابي",
             sections=[
-                "**Bias:** Supportive",
-                "**Confidence:** Medium",
+                "🧠 البيتكوين والإيثريوم عم يدعموا شهية المخاطرة",
+                "📈 هذا الشي ممكن يخدم setups القوية",
                 "",
-                "• Bitcoin and Ethereum are supporting overall risk appetite",
-                "• This can help strong alt setups continue",
-                "",
-                "**Action:** Favor quality setups, but avoid chasing.",
+                "👉 **الإجراء:** ركّز على الجودة، لكن لا تطارد",
             ],
             color=GREEN,
         )
     else:
         embed = format_public_embed(
-            title="🌍 Macro Environment",
+            title="🌍 Macro — جو عام حذر",
             sections=[
-                "**Bias:** Cautious",
-                "**Confidence:** Medium",
+                "🧠 البيتكوين والإيثريوم تحت ضغط",
+                "⚠️ هذا الشي يضعف setups الضعيفة أسرع",
                 "",
-                "• Bitcoin and Ethereum are under pressure",
-                "• Weak alt setups can fail faster in this backdrop",
-                "",
-                "**Action:** Reduce aggression and wait for cleaner confirmation.",
+                "👉 **الإجراء:** خفف الاندفاع وانتظر confirmation أنظف",
             ],
             color=RED,
         )
@@ -1452,15 +1781,167 @@ def monitor_macro():
 
 
 # =========================================================
+# INSIGHT ENGINE
+# =========================================================
+INSIGHT_BANK = {
+    "btc_dominant": [
+        ("btc_dom_1", "🧠 Insight — هيمنة بيتكوين", [
+            "🧲 لما السيولة تبقى حول البيتكوين، الألتات تصير أصعب",
+            "⚖️ مو كل حركة صغيرة بالألتات معناها بداية موسم",
+            "⏳ الصبر هون أهم من الحماس",
+        ], "لا تلاحق أي حركة ضعيفة على الألتات"),
+        ("btc_dom_2", "🧠 Insight — انتقائية", [
+            "🎯 بمرحلة هيمنة البيتكوين، الجودة أهم من الكثرة",
+            "🫥 كثير من الألتات تتحرك بدون متابعة حقيقية",
+            "🧠 السوق يكافئ الانتقاء، مو العشوائية",
+        ], "اختَر الأقوى فقط"),
+    ],
+    "altseason_building": [
+        ("alt_build_1", "👀 Insight — السوق عم يجهّز", [
+            "🌱 البوادر الأولى ما تعني اندفاع كامل",
+            "🧠 الذكي يراقب مبكرًا لكن ما يتهور",
+            "⚖️ التدرج هون أقوى من الدخول العنيف",
+        ], "راقب الألتات اللي عم تثبت قوتها"),
+        ("alt_build_2", "🔄 Insight — انتقال السيولة", [
+            "💧 السوق ما بيتحول بلحظة واحدة",
+            "🧠 السيولة تنتقل تدريجيًا بين القطاعات",
+            "⏳ أهم شيء تلاحظ التغيير قبل الزحمة",
+        ], "خليك مبكر، مو متأخر"),
+    ],
+    "altseason_active": [
+        ("alt_active_1", "🚀 Insight — موسم ألتات", [
+            "📈 وقت القوة الواسعة، الطمع يصير أخطر من الخوف",
+            "🧠 الربح الحقيقي مو بس بالدخول، بل بالخروج الصح",
+            "⚠️ لا تحول الزخم إلى تهور",
+        ], "استفد من الحركة لكن خذ أرباحك بذكاء"),
+        ("alt_active_2", "🔥 Insight — لا تطارد", [
+            "⚡ حتى بموسم الألتات، مو كل شمعة خضراء تنشرى",
+            "🧠 المطاردة آخر الحركة من أكثر الأخطاء تكرارًا",
+            "🎯 الأفضل انتظار فرصة أنظف",
+        ], "لا تدخل فقط لأن السوق صار حار"),
+    ],
+    "fear_defensive": [
+        ("fear_1", "⚠️ Insight — وقت الخوف", [
+            "📉 الخوف ما يعني فرصة فورية دائمًا",
+            "🧠 كثير من الناس تشتري مبكرًا فقط لأنها رأت نزولًا",
+            "⏳ القوة هي التأكيد، مو مجرد السعر الأرخص",
+        ], "انتظر الإشارة، لا تتخيلها"),
+        ("fear_2", "🧠 Insight — السوق الدفاعي", [
+            "🛡️ لما السوق يصير دفاعي، الحفاظ على رأس المال أولوية",
+            "⚖️ الصفقة التي لا تأخذها قد تكون أفضل صفقة",
+            "🫥 مو كل ساعة لازم تدخل فيها",
+        ], "أحيانًا عدم الدخول هو القرار الصح"),
+    ],
+    "greed_hot": [
+        ("greed_1", "🔥 Insight — انتبه من FOMO", [
+            "📈 السوق الحار يعطي إحساس أن كل شيء سهل",
+            "🧠 وهنا يبدأ أكثر الغلط",
+            "⚠️ آخر المشترين عادةً يشترون أسوأ مكان",
+        ], "لا تطارد الشمعة"),
+        ("greed_2", "🎯 Insight — ضبط النفس", [
+            "💰 الربح بدون انضباط يتحول بسرعة لخسارة",
+            "🧠 القوة الحقيقية هي التحكم بالطمع",
+            "⚖️ السوق يعطي… ثم يختبرك",
+        ], "خذ جزء من الربح ولا تنتظر القمة المثالية"),
+    ],
+    "patience_range": [
+        ("patience_1", "🧊 Insight — مرحلة صبر", [
+            "🫥 السوق الممل يستهلك نفسية المتداول",
+            "⚖️ كثرة الحركة ليست دليل فرص",
+            "⏳ أحيانًا أفضل شيء هو الانتظار",
+        ], "لا تجبر صفقة"),
+        ("patience_2", "🧠 Insight — الوضوح", [
+            "👀 لما الصورة تكون ضبابية، القرار يتعب أكثر",
+            "🧠 المتداول الجيد لا يحارب الغموض",
+            "🎯 الوضوح جزء من الفرصة نفسها",
+        ], "انتظر حتى تصير الصورة أوضح"),
+    ],
+    "transition": [
+        ("transition_1", "🔄 Insight — السوق يتغيّر", [
+            "🧠 مراحل الانتقال تربك كثير من الناس",
+            "⚖️ لا تعتمد على الصورة القديمة بالكامل",
+            "⏳ لكن لا تعلن عن دورة جديدة مبكرًا جدًا",
+        ], "راقب التحول قبل أن تبني قرارًا كبيرًا"),
+    ],
+}
+
+
+def pick_insight_for_regime(regime):
+    pool = INSIGHT_BANK.get(regime) or INSIGHT_BANK.get("transition", [])
+    if not pool:
+        return None
+
+    shuffled = pool[:]
+    random.shuffle(shuffled)
+
+    for key, title, bullets, action in shuffled:
+        if key not in recent_insights:
+            recent_insights.append(key)
+            return {
+                "key": key,
+                "title": title,
+                "bullets": bullets,
+                "action": action,
+            }
+
+    key, title, bullets, action = random.choice(pool)
+    recent_insights.append(key)
+    return {
+        "key": key,
+        "title": title,
+        "bullets": bullets,
+        "action": action,
+    }
+
+
+def build_insight_embed(insight):
+    lines = [f"- {x}" for x in insight["bullets"]]
+    lines.append("")
+    lines.append(f"👉 **النصيحة:** {insight['action']}")
+
+    return {
+        "title": insight["title"],
+        "description": "\n".join(lines),
+        "color": PURPLE,
+        "footer": {"text": f"{BOT_NAME} • {footer_stamp()}"},
+    }
+
+
+def maybe_send_insight():
+    global last_insight_time, next_insight_after
+
+    if (time.time() - last_any_alert_time) < INSIGHT_BLOCK_AFTER_ALERT_SECONDS:
+        return
+
+    if (time.time() - last_insight_time) < next_insight_after:
+        return
+
+    regime = market_regime_cache.get("regime", "transition")
+    insight = pick_insight_for_regime(regime)
+    if not insight:
+        return
+
+    send_embed_obj(build_insight_embed(insight))
+    last_insight_time = time.time()
+    next_insight_after = random.randint(INSIGHT_MIN_SECONDS, INSIGHT_MAX_SECONDS)
+
+
+# =========================================================
 # LOOP
 # =========================================================
 def run_cycle():
     refresh_macro()
+    refresh_market_regime()
+
     latest_block = get_latest_block()
     refresh_one_scan_layer(latest_block)
+
     monitor_tokens()
     monitor_rotation()
     monitor_macro()
+    monitor_market_regime()
+    maybe_send_insight()
+
     save_state()
     print("Loop completed successfully", flush=True)
 
