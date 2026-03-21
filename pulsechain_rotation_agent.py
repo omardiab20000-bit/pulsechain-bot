@@ -5,6 +5,56 @@ import time
 import statistics
 import html
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse, unquote
+import xml.etree.ElementTree as ET
+
+import httpx
+
+# =========================================================
+# CONFIG
+# =========================================================
+DISCORD_WEBHOOK = "YOUR_WEBHOOK_HERE"
+
+POLL_SECONDS = 600
+MACRO_CACHE_SECONDS = 900
+SCAN_CACHE_SECONDS = 1800
+SENTIMENT_CACHE_SECONDS = 1800
+STATE_SAVE_SECONDS = 120
+
+TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 25
+ROTATION_ALERT_COOLDOWN_SECONDS = 60 * 45
+MACRO_ALERT_COOLDOWN_SECONDS = 60 * 60
+
+SENTIMENT_TRIGGER_PRICE_PCT = 4.0
+SENTIMENT_TRIGGER_VOL_LIQ = 0.035
+SENTIMENT_TRIGGER_LIQ_DELTA = 6.0
+SENTIMENT_MAX_NEWS_ITEMS = 5
+SENTIMENT_MAX_X_ITEMS = 5
+
+DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+PULSESCAN_API = "https://api.scan.pulsechain.com/api"
+COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+DDG_HTML_SEARCH = "https://duckduckgo.com/html/"
+
+DEBUG = True
+STATE_FILE = "pulsechain_rotation_state.json"
+TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+client = httpx.Client(
+    timeout=httpx.Timeout(20.0, connect=10.0),
+    follow_redirects=True,
+    headers={"User-Agent": "PulseChainRotationAgent/9.0"},
+)
+
+
+import json
+import os
+import re
+import time
+import statistics
+import html
+from datetime import datetime, timezone
 from urllib.parse import quote_plus, parse_qs, urlparse, unquote
 import xml.etree.ElementTree as ET
 
