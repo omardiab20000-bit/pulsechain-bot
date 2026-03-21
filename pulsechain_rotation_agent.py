@@ -10,10 +10,11 @@ import xml.etree.ElementTree as ET
 
 import httpx
 
+
 # =========================================================
 # CONFIG
 # =========================================================
-DISCORD_WEBHOOK = "YOUR_WEBHOOK_HERE"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
 
 POLL_SECONDS = 600
 MACRO_CACHE_SECONDS = 900
@@ -41,78 +42,13 @@ DEBUG = True
 STATE_FILE = "pulsechain_rotation_state.json"
 TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
+PUBLIC_MODE = "premium"
+BOT_NAME = "PulseChain Rotation Agent PRO"
+
 client = httpx.Client(
     timeout=httpx.Timeout(20.0, connect=10.0),
     follow_redirects=True,
-    headers={"User-Agent": "PulseChainRotationAgent/9.0"},
-)
-
-
-import json
-import os
-import re
-import time
-import statistics
-import html
-from datetime import datetime, timezone
-from urllib.parse import quote_plus, parse_qs, urlparse, unquote
-import xml.etree.ElementTree as ET
-
-import httpx
-
-# =========================================================
-# CONFIG
-# =========================================================
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1483880814537216100/gM_wVR-G6zJrh05I30pkkVDLQ9YH-alYSWLR-f-4-MITMx7YR4RiVX-1qrSaN2sWM9or"
-
-POLL_SECONDS = 600                    # 10 minutes
-MACRO_CACHE_SECONDS = 900             # 15 minutes
-SCAN_CACHE_SECONDS = 1800             # 30 minutes
-SENTIMENT_CACHE_SECONDS = 1800        # 30 minutes
-STATE_SAVE_SECONDS = 120              # save every 2 minutes max
-
-TOKEN_ALERT_COOLDOWN_SECONDS = 60 * 25
-ROTATION_ALERT_COOLDOWN_SECONDS = 60 * 45
-MACRO_ALERT_COOLDOWN_SECONDS = 60 * 60
-
-SENTIMENT_TRIGGER_PRICE_PCT = 4.0
-SENTIMENT_TRIGGER_VOL_LIQ = 0.035
-SENTIMENT_TRIGGER_LIQ_DELTA = 6.0
-SENTIMENT_MAX_NEWS_ITEMS = 5
-SENTIMENT_MAX_X_ITEMS = 5
-
-DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
-PULSESCAN_API = "https://api.scan.pulsechain.com/api"
-COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
-GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
-DDG_HTML_SEARCH = "https://duckduckgo.com/html/"
-
-DEBUG = True
-STATE_FILE = "pulsechain_rotation_state.json"
-TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-
-BULLISH_WORDS = {
-    "bull", "bullish", "buy", "buys", "bought", "accumulate", "accumulation",
-    "surge", "spike", "breakout", "breaks", "launch", "deployed", "deploys",
-    "liquidity", "whale", "burn", "partnership", "listing", "trend", "trending",
-    "volume", "adoption", "upgrade", "boost", "pumps", "pump"
-}
-
-BEARISH_WORDS = {
-    "bear", "bearish", "sell", "sells", "dump", "dumps", "rug", "hack", "exploit",
-    "drain", "down", "collapse", "liquidation", "fear", "panic", "red", "drop",
-    "crash", "lawsuit", "warn", "warning", "scam", "weak", "outflow"
-}
-
-CATALYST_WORDS = {
-    "deployed", "deploy", "liquidity", "listing", "launch", "burn", "bridge",
-    "partnership", "upgrade", "buyback", "boost", "trend", "trending", "whale"
-}
-
-client = httpx.Client(
-    timeout=20.0,
-    follow_redirects=True,
-    headers={"User-Agent": "PulseChainRotationAgent/9.0"}
+    headers={"User-Agent": "PulseChainRotationAgent/10.0"},
 )
 
 # =========================================================
@@ -153,6 +89,28 @@ RED = 0xE74C3C
 YELLOW = 0xF1C40F
 BLUE = 0x3498DB
 PURPLE = 0x8E44AD
+GREY = 0x95A5A6
+
+# =========================================================
+# KEYWORDS
+# =========================================================
+BULLISH_WORDS = {
+    "bull", "bullish", "buy", "buys", "bought", "accumulate", "accumulation",
+    "surge", "spike", "breakout", "breaks", "launch", "deployed", "deploys",
+    "liquidity", "whale", "burn", "partnership", "listing", "trend", "trending",
+    "volume", "adoption", "upgrade", "boost", "pumps", "pump"
+}
+
+BEARISH_WORDS = {
+    "bear", "bearish", "sell", "sells", "dump", "dumps", "rug", "hack", "exploit",
+    "drain", "down", "collapse", "liquidation", "fear", "panic", "red", "drop",
+    "crash", "lawsuit", "warn", "warning", "scam", "weak", "outflow"
+}
+
+CATALYST_WORDS = {
+    "deployed", "deploy", "liquidity", "listing", "launch", "burn", "bridge",
+    "partnership", "upgrade", "buyback", "boost", "trend", "trending", "whale"
+}
 
 # =========================================================
 # STATE
@@ -196,7 +154,7 @@ sentiment_cache = {
         "updated_at": 0.0,
         "sentiment_score": 0.0,
         "mood": "quiet",
-        "summary": "📰 لا يوجد تأكيد اجتماعي واضح",
+        "summary": "No clear social confirmation",
         "bullish_hits": 0,
         "bearish_hits": 0,
         "news_hits": 0,
@@ -267,45 +225,68 @@ def token_symbols():
     return [t["symbol"] for t in TOKENS]
 
 
-def send_embed(title, description, color=PURPLE, url=None):
-    if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
-        print("Webhook not set correctly. Put your Discord webhook in DISCORD_WEBHOOK.", flush=True)
-        return
-
-    embed = {
-        "title": title,
-        "description": description,
-        "color": color,
-        "footer": {"text": f"PulseChain Rotation Agent • {footer_stamp()}"},
-    }
-    if url:
-        embed["url"] = url
-
-    payload = {"embeds": [embed]}
-
-    try:
-        r = client.post(DISCORD_WEBHOOK, json=payload)
-        r.raise_for_status()
-        print(f"[SEND] {title}", flush=True)
-    except Exception as e:
-        print("Webhook error:", e, flush=True)
-
-
 def parse_topic_address(topic_value):
     if not topic_value or len(topic_value) < 42:
         return ""
     return "0x" + topic_value[-40:].lower()
 
 
-def get_token_by_symbol(symbol):
-    for t in TOKENS:
-        if t["symbol"] == symbol:
-            return t
-    return None
-
-
 def ensure_symbol_dict(base, default_value):
     return {symbol: base.get(symbol, default_value) for symbol in token_symbols()}
+
+
+def confidence_from_score(score):
+    if score >= 8.2:
+        return "High"
+    if score >= 6.2:
+        return "Medium"
+    return "Low"
+
+
+def market_context_label():
+    bias = market_cache.get("bias", "neutral")
+    if bias == "bullish":
+        return "Supportive"
+    if bias == "bearish":
+        return "Cautious"
+    return "Mixed"
+
+
+def format_public_embed(title, sections, color=PURPLE, url=None):
+    description_lines = []
+    for line in sections:
+        if line:
+            description_lines.append(line)
+
+    embed = {
+        "title": title,
+        "description": "\n".join(description_lines),
+        "color": color,
+        "footer": {"text": f"{BOT_NAME} • {footer_stamp()}"},
+    }
+    if url:
+        embed["url"] = url
+    return embed
+
+
+def send_embed_obj(embed):
+    if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
+        print("Webhook not set correctly.", flush=True)
+        return
+
+    payload = {"embeds": [embed]}
+
+    try:
+        r = client.post(DISCORD_WEBHOOK, json=payload)
+        r.raise_for_status()
+        print(f"[SEND] {embed.get('title')}", flush=True)
+    except Exception as e:
+        print("Webhook error:", e, flush=True)
+
+
+def send_embed(title, description, color=PURPLE, url=None):
+    embed = format_public_embed(title, [description], color=color, url=url)
+    send_embed_obj(embed)
 
 
 def save_state(force=False):
@@ -353,10 +334,10 @@ def load_state():
         last_token_signals.update(ensure_symbol_dict(data.get("last_token_signals", {}), None))
         last_token_alert_time.update(ensure_symbol_dict(data.get("last_token_alert_time", {}), 0))
 
-        last_rotation_state = data.get("last_rotation_state")
-        last_rotation_alert_time = safe_float(data.get("last_rotation_alert_time"), 0.0)
-        last_macro_signal = data.get("last_macro_signal")
-        last_macro_alert_time = safe_float(data.get("last_macro_alert_time"), 0.0)
+        globals()["last_rotation_state"] = data.get("last_rotation_state")
+        globals()["last_rotation_alert_time"] = safe_float(data.get("last_rotation_alert_time"), 0.0)
+        globals()["last_macro_signal"] = data.get("last_macro_signal")
+        globals()["last_macro_alert_time"] = safe_float(data.get("last_macro_alert_time"), 0.0)
 
         if isinstance(data.get("market_cache"), dict):
             market_cache.update(data["market_cache"])
@@ -381,7 +362,7 @@ def load_state():
 
 
 # =========================================================
-# HTTP FETCHERS
+# HTTP
 # =========================================================
 def get_json(url, params=None, timeout=10.0):
     r = client.get(url, params=params, timeout=timeout)
@@ -447,7 +428,7 @@ def refresh_macro():
 
 
 # =========================================================
-# DEXSCREENER
+# DEX
 # =========================================================
 def fetch_token_dex(search_term):
     try:
@@ -503,14 +484,9 @@ def fetch_token_dex(search_term):
         pair_address = best.get("pairAddress") or ""
         pair_url = best.get("url") or ""
 
-        base_token = best.get("baseToken") or {}
-        quote_token = best.get("quoteToken") or {}
-
         return {
             "pair_address": pair_address,
             "url": pair_url,
-            "base_symbol": base_token.get("symbol") or "",
-            "quote_symbol": quote_token.get("symbol") or "",
             "liq_usd": liq_usd,
             "vol_h1": vol_h1,
             "vol_h6": vol_h6,
@@ -744,7 +720,7 @@ def refresh_one_scan_layer(latest_block):
 
 
 # =========================================================
-# SENTIMENT / CATALYST INVESTIGATION
+# SENTIMENT
 # =========================================================
 def count_keywords(text, words):
     found = 0
@@ -895,14 +871,14 @@ def should_refresh_sentiment(symbol, market):
 
 def summarize_sentiment(score, bull, bear, catalysts, news_count, x_count):
     if news_count == 0 and x_count == 0:
-        return "📰 لا يوجد تأكيد اجتماعي واضح", "quiet"
+        return "No clear social confirmation", "quiet"
     if score >= 3.5 or (bull >= bear + 3 and catalysts >= 1):
-        return "📰 الضجة إيجابية وعم تدعم الحركة", "positive"
+        return "Narrative flow is supportive", "positive"
     if score <= -3.5 or (bear >= bull + 3):
-        return "📰 الضجة سلبية أو فيها خوف", "negative"
+        return "Social tone is leaning negative", "negative"
     if catalysts >= 2 and bull >= bear:
-        return "📰 في catalyst خفيف بس التأكيد متوسط", "catalyst"
-    return "📰 الضجة موجودة لكن مو حاسمة", "mixed"
+        return "Catalyst present, confirmation moderate", "catalyst"
+    return "Mixed flow, not decisive yet", "mixed"
 
 
 def refresh_sentiment_for_token(token, market):
@@ -1012,6 +988,29 @@ def build_market_snapshot(token):
         sell_pressure += 0.6
     sell_pressure = clamp(sell_pressure, 0, 10)
 
+    setup_quality = 0.0
+    setup_quality += accumulation_score * 0.45
+    setup_quality += whale_pressure * 0.18
+    setup_quality += clamp((dex["ratio_h1"] - 1.0) * 4.0, -1.0, 2.5)
+    setup_quality += clamp(scan_stats["activity_score"] * 0.10, 0.0, 1.0)
+    setup_quality += clamp(safe_float(sentiment.get("sentiment_score"), 0.0) * 0.14, -1.2, 1.2)
+    if market_cache.get("bias") == "bullish":
+        setup_quality += 0.6
+    elif market_cache.get("bias") == "bearish":
+        setup_quality -= 0.6
+    setup_quality = clamp(setup_quality, 0, 10)
+
+    risk_score = 0.0
+    risk_score += sell_pressure * 0.55
+    risk_score += 1.0 if dex["ratio_h1"] < 0.95 else 0.0
+    risk_score += 0.9 if dex["liq_usd"] < 50000 else 0.0
+    risk_score += 0.8 if liq_stats["liq_delta_pct"] <= -6 else 0.0
+    if sentiment["mood"] == "negative":
+        risk_score += 0.8
+    if market_cache.get("bias") == "bearish":
+        risk_score += 0.8
+    risk_score = clamp(risk_score, 0, 10)
+
     merged = {}
     merged.update(dex)
     merged.update(scan_stats)
@@ -1019,118 +1018,197 @@ def build_market_snapshot(token):
     merged["whale_pressure"] = whale_pressure
     merged["accumulation_score"] = accumulation_score
     merged["sell_pressure"] = sell_pressure
+    merged["setup_quality"] = setup_quality
+    merged["risk_score"] = risk_score
     merged["sentiment"] = sentiment
     return merged
 
 
 # =========================================================
-# TOKEN SIGNALS
+# PREMIUM SIGNAL ENGINE
 # =========================================================
+def build_reasons(m):
+    reasons = []
+
+    if m["ratio_h1"] >= 1.18:
+        reasons.append("Buyers are maintaining control")
+    elif m["ratio_h1"] <= 0.95:
+        reasons.append("Sellers are still leading flow")
+
+    if m["h1_change"] < 0 and m["ratio_h1"] >= 1.10:
+        reasons.append("Weakness is being absorbed")
+    elif m["h6_change"] > 0 and m["ratio_h1"] >= 1.05:
+        reasons.append("Short-term momentum is improving")
+    elif m["h6_change"] <= -6:
+        reasons.append("Pressure is still visible across the last few hours")
+
+    if m["liq_delta_pct"] >= 6:
+        reasons.append("Liquidity conditions are improving")
+    elif m["liq_delta_pct"] <= -6:
+        reasons.append("Liquidity is pulling back")
+
+    sentiment = m.get("sentiment") or {}
+    mood = sentiment.get("mood", "quiet")
+    if mood in ("positive", "catalyst"):
+        reasons.append("Narrative flow is supportive")
+    elif mood == "negative":
+        reasons.append("Narrative flow is working against the move")
+    elif mood == "mixed":
+        reasons.append("Social confirmation is still mixed")
+
+    if market_cache.get("bias") == "bullish":
+        reasons.append("Macro backdrop is supportive")
+    elif market_cache.get("bias") == "bearish":
+        reasons.append("Macro backdrop is not helping")
+
+    deduped = []
+    for r in reasons:
+        if r not in deduped:
+            deduped.append(r)
+
+    return deduped[:3]
+
+
 def derive_token_signal(symbol, m):
     ratio = m["ratio_h1"]
     h1 = m["h1_change"]
     h6 = m["h6_change"]
-    whale = m["whale_pressure"]
     accumulation = m["accumulation_score"]
-    sell_pressure = m["sell_pressure"]
-    macro_bias = market_cache.get("bias", "neutral")
+    risk_score = m["risk_score"]
+    setup_quality = m["setup_quality"]
+    whale = m["whale_pressure"]
     sentiment = m.get("sentiment") or {}
     sentiment_mood = sentiment.get("mood", "quiet")
+    macro_bias = market_cache.get("bias", "neutral")
 
+    alert_type = None
+    bias = "Neutral"
+    confidence = "Low"
+    action = "Stay patient."
     state = "neutral"
-    mood = "neutral"
-    action = "خليك كاش — انتظار"
+    color = GREY
 
-    if accumulation >= 5.8 and ratio >= 1.15:
-        if h1 < 0:
-            state = "accumulate"
-            mood = "bullish"
-            action = "راقب — دخول تدريجي"
-        else:
-            state = "strong"
-            mood = "bullish"
-            action = "عزّز بشكل تدريجي"
+    # Hard no-alert zone
+    if (
+        0.98 <= ratio <= 1.08
+        and abs(h1) < 1.8
+        and setup_quality < 5.8
+        and risk_score < 5.8
+        and sentiment_mood in ("quiet", "mixed")
+    ):
+        return {
+            "state": "neutral",
+            "alert_type": None,
+            "bias": "Neutral",
+            "confidence": "Low",
+            "action": "No clear edge.",
+            "color": GREY,
+            "reasons": [],
+            "summary": "No clean signal",
+        }
 
-    if whale >= 6.2 and ratio >= 1.18:
-        state = "strong"
-        mood = "bullish"
-        action = "راقب — لا تطارد"
+    # Risk first
+    if risk_score >= 7.3 and ratio < 0.98:
+        alert_type = "Risk Rising"
+        bias = "Bearish"
+        confidence = confidence_from_score(risk_score)
+        action = "Avoid aggressive entries."
+        state = "risk"
+        color = RED
 
-    if sell_pressure >= 5.5 and ratio < 1.0:
-        state = "sell"
-        mood = "bearish"
-        action = "خليك كاش — خطر"
+    elif risk_score >= 8.3 and h1 <= -7 and ratio < 0.95:
+        alert_type = "Breakdown Risk"
+        bias = "Bearish"
+        confidence = "High"
+        action = "Stand aside until pressure cools."
+        state = "risk"
+        color = RED
 
-    if h1 <= -8 and ratio < 0.95:
-        state = "flush"
-        mood = "bearish"
-        action = "لا دخول — انتبه"
+    # Strong actionable entry style
+    elif (
+        setup_quality >= 8.1
+        and accumulation >= 6.3
+        and ratio >= 1.15
+        and risk_score <= 5.8
+    ):
+        alert_type = "Actionable Entry"
+        bias = "Bullish"
+        confidence = confidence_from_score(setup_quality)
+        action = "Watch for gradual entry. Do not chase spikes."
+        state = "entry"
+        color = GREEN
 
-    if macro_bias == "bearish" and mood == "bullish" and h1 <= 0:
+    # Dip watch
+    elif (
+        setup_quality >= 6.6
+        and accumulation >= 5.8
+        and ratio >= 1.08
+        and h1 < 0
+        and risk_score <= 6.2
+    ):
+        alert_type = "Dip Watch"
+        bias = "Bullish"
+        confidence = confidence_from_score(setup_quality)
+        action = "Monitor for confirmation before sizing in."
         state = "watch"
-        mood = "watch"
-        action = "راقب — لا تستعجل"
+        color = YELLOW
 
-    if symbol == "PLS":
-        if state in ("accumulate", "strong"):
-            summary = "🧠 السوق عم يجمع بولس"
-        elif state in ("sell", "flush"):
-            summary = "🧠 في ضغط بيع على بولس"
-        elif state == "watch":
-            summary = "🧠 بولس تحت المراقبة"
-        else:
-            summary = "🧠 بولس هادئة"
-    elif symbol == "PLSX":
-        if state in ("accumulate", "strong"):
-            summary = "🧠 السوق عم يجمع بولس اكس"
-        elif state in ("sell", "flush"):
-            summary = "🧠 في ضغط بيع على بولس اكس"
-        elif state == "watch":
-            summary = "🧠 بولس اكس تحت المراقبة"
-        else:
-            summary = "🧠 بولس اكس هادئة"
+    # Strength building
+    elif (
+        setup_quality >= 6.7
+        and accumulation >= 5.9
+        and ratio >= 1.10
+        and h6 > -2.5
+    ):
+        alert_type = "Strength Building"
+        bias = "Bullish"
+        confidence = confidence_from_score(setup_quality)
+        action = "Keep it on watch for continuation."
+        state = "strength"
+        color = GREEN
+
+    # Macro caution override
+    elif macro_bias == "bearish" and setup_quality >= 6.3 and h1 <= 0:
+        alert_type = "Watchlist Only"
+        bias = "Cautious"
+        confidence = confidence_from_score(setup_quality)
+        action = "Interesting setup, but macro is not helping."
+        state = "watch"
+        color = YELLOW
+
+    # Narrative strength but not enough
+    elif sentiment_mood in ("positive", "catalyst") and setup_quality >= 5.9:
+        alert_type = "Watchlist Only"
+        bias = "Constructive"
+        confidence = "Low"
+        action = "Narrative is improving, but price structure still needs proof."
+        state = "watch"
+        color = YELLOW
+
     else:
-        if state in ("accumulate", "strong"):
-            summary = "🧠 في تجميع على PRVX"
-        elif state in ("sell", "flush"):
-            summary = "🧠 PRVX تحت ضغط"
-        elif state == "watch":
-            summary = "🧠 PRVX تحت المراقبة"
-        else:
-            summary = "🧠 PRVX هادئة"
+        return {
+            "state": "neutral",
+            "alert_type": None,
+            "bias": "Neutral",
+            "confidence": "Low",
+            "action": "No clear edge.",
+            "color": GREY,
+            "reasons": [],
+            "summary": "No clean signal",
+        }
 
-    reasons = []
-    if mood == "bullish":
-        reasons.append("📈 المشترين أقوى")
-        if h1 < 0 and ratio >= 1.1:
-            reasons.append("🛡️ الهبوط عم ينشفط")
-        elif h6 > 0:
-            reasons.append("⚡ الحركة تتحسن")
-        if macro_bias == "bullish":
-            reasons.append("🌤️ السوق العام مساعد")
-    elif mood == "bearish":
-        reasons.append("📉 البائعين أقوى")
-        if h6 <= -6:
-            reasons.append("🌧️ الضغط واضح")
-        if macro_bias == "bearish":
-            reasons.append("⚠️ السوق العام سلبي")
-    elif mood == "watch":
-        reasons.append("👀 في حركة لكن مو مؤكدة")
-        reasons.append("🫥 بدها تأكيد")
-
-    if sentiment_mood in ("positive", "catalyst"):
-        reasons.append("📰 الضجة داعمة")
-    elif sentiment_mood == "negative":
-        reasons.append("📰 الضجة ضد الحركة")
-    elif sentiment_mood == "mixed":
-        reasons.append("📰 الأخبار مختلطة")
+    reasons = build_reasons(m)
+    summary = f"{symbol} is showing a clearer setup."
 
     return {
         "state": state,
-        "mood": mood,
-        "summary": summary,
-        "reasons": reasons[:3],
+        "alert_type": alert_type,
+        "bias": bias,
+        "confidence": confidence,
         "action": action,
+        "color": color,
+        "reasons": reasons,
+        "summary": summary,
     }
 
 
@@ -1150,23 +1228,30 @@ def should_send_token_alert(symbol, signal_key, state):
     return False
 
 
-def format_sentiment_block(sentiment):
-    mood = sentiment.get("mood", "quiet")
-    score = round(safe_float(sentiment.get("sentiment_score"), 0.0), 1)
-    news_hits = safe_int(sentiment.get("news_hits"), 0)
-    x_hits = safe_int(sentiment.get("x_hits"), 0)
-    catalyst_hits = safe_int(sentiment.get("catalyst_hits"), 0)
+def build_token_embed(token, market, signal):
+    title = f"{token['label']} — {signal['alert_type']}"
+    sections = [
+        f"**Bias:** {signal['bias']}",
+        f"**Confidence:** {signal['confidence']}",
+        f"**Market Context:** {market_context_label()}",
+        "",
+    ]
 
-    lines = [f"- {sentiment.get('summary', '📰 لا يوجد تأكيد اجتماعي واضح')} (score {score})"]
-    lines.append(f"- 🔎 news={news_hits} | x-indexed={x_hits} | catalyst={catalyst_hits}")
+    for reason in signal["reasons"][:3]:
+        sections.append(f"• {reason}")
 
-    top_news = (sentiment.get("news_headlines") or [])[:1]
-    top_x = (sentiment.get("x_headlines") or [])[:1]
-    if top_news:
-        lines.append(f"- 🗞️ {top_news[0]}")
-    if top_x and mood != "quiet":
-        lines.append(f"- 𝕏 {top_x[0]}")
-    return "\n".join(lines)
+    if signal["reasons"]:
+        sections.append("")
+
+    sections.append(f"**Action:** {signal['action']}")
+
+    embed = format_public_embed(
+        title=title,
+        sections=sections,
+        color=signal["color"],
+        url=market.get("url") or None,
+    )
+    return embed
 
 
 def monitor_tokens():
@@ -1175,7 +1260,6 @@ def monitor_tokens():
 
     for token in TOKENS:
         symbol = token["symbol"]
-        label = token["label"]
 
         market = build_market_snapshot(token)
         if not market:
@@ -1184,62 +1268,47 @@ def monitor_tokens():
 
         latest_token_market[symbol] = market
         signal = derive_token_signal(symbol, market)
+
         sentiment = market.get("sentiment") or {}
-
-        state = signal["state"]
-        mood = signal["mood"]
-
         signal_key = (
-            f"{state}|{mood}|"
+            f"{signal['state']}|{signal['alert_type']}|{signal['bias']}|{signal['confidence']}|"
             f"{round(market['ratio_h1'], 2)}|"
             f"{round(market['h1_change'], 1)}|"
             f"{round(market['h6_change'], 1)}|"
             f"{round(market['whale_pressure'], 1)}|"
             f"{round(market['accumulation_score'], 1)}|"
             f"{round(market['sell_pressure'], 1)}|"
-            f"{round(market['activity_score'], 1)}|"
+            f"{round(market['setup_quality'], 1)}|"
+            f"{round(market['risk_score'], 1)}|"
             f"{round(market['liq_delta_pct'], 1)}|"
-            f"{round(market['big_transfer_score'], 1)}|"
             f"{sentiment.get('mood', 'quiet')}|"
             f"{round(safe_float(sentiment.get('sentiment_score'), 0.0), 1)}"
         )
 
-        print(f"[TOKEN] {symbol} state={state} mood={mood} key={signal_key}", flush=True)
+        log(
+            f"{symbol} state={signal['state']}",
+            f"type={signal['alert_type']}",
+            f"ratio={round(market['ratio_h1'],2)}",
+            f"h1={round(market['h1_change'],1)}",
+            f"h6={round(market['h6_change'],1)}",
+            f"setup={round(market['setup_quality'],1)}",
+            f"risk={round(market['risk_score'],1)}",
+            f"accum={round(market['accumulation_score'],1)}",
+            f"whale={round(market['whale_pressure'],1)}",
+            f"liqΔ={round(market['liq_delta_pct'],1)}",
+            f"sent={sentiment.get('mood','quiet')}/{round(safe_float(sentiment.get('sentiment_score'),0.0),1)}",
+        )
 
-        if not should_send_token_alert(symbol, signal_key, state):
-            last_token_states[symbol] = state
+        if not should_send_token_alert(symbol, signal_key, signal["state"]):
+            last_token_states[symbol] = signal["state"]
             last_token_signals[symbol] = signal_key
             continue
 
-        if mood == "bullish":
-            color = GREEN
-            icon = "🟢"
-        elif mood == "bearish":
-            color = RED
-            icon = "🔴"
-        elif mood == "watch":
-            color = YELLOW
-            icon = "🟡"
-        else:
-            color = PURPLE
-            icon = "⚪"
-
-        lines = [signal["summary"]]
-        lines.extend(signal["reasons"])
-
-        desc = "\n".join(f"- {x}" for x in lines)
-        desc += "\n"
-        desc += format_sentiment_block(sentiment)
-        desc += (
-            f"\n- 📊 ratio={market['ratio_h1']:.2f} | h1={market['h1_change']:.1f}% | "
-            f"liqΔ={market['liq_delta_pct']:.1f}% | whale={market['whale_pressure']:.1f}"
-        )
-        desc += f"\n\n👉 **Take Action:** {signal['action']}"
-
-        send_embed(f"{icon} {label}", desc, color, url=market.get("url") or None)
+        embed = build_token_embed(token, market, signal)
+        send_embed_obj(embed)
 
         last_token_alert_time[symbol] = time.time()
-        last_token_states[symbol] = state
+        last_token_states[symbol] = signal["state"]
         last_token_signals[symbol] = signal_key
 
 
@@ -1254,40 +1323,58 @@ def detect_rotation():
         return None
 
     pls_strength = (
-        pls["accumulation_score"] * 0.42 +
-        pls["whale_pressure"] * 0.28 +
-        clamp(pls["ratio_h1"], 0, 3) * 1.20 +
+        pls["setup_quality"] * 0.46 +
+        pls["whale_pressure"] * 0.18 +
+        clamp(pls["ratio_h1"], 0, 3) * 1.10 +
         clamp(pls["activity_score"], 0, 10) * 0.15 +
-        clamp(pls["big_transfer_score"], 0, 6) * 0.22 +
+        clamp(pls["big_transfer_score"], 0, 6) * 0.20 +
         max(pls["liq_delta_pct"], 0) * 0.04 +
-        clamp(safe_float((pls.get("sentiment") or {}).get("sentiment_score"), 0.0), -3.0, 3.0) * 0.18
+        clamp(safe_float((pls.get("sentiment") or {}).get("sentiment_score"), 0.0), -3.0, 3.0) * 0.16
     )
 
     plsx_strength = (
-        plsx["accumulation_score"] * 0.42 +
-        plsx["whale_pressure"] * 0.28 +
-        clamp(plsx["ratio_h1"], 0, 3) * 1.20 +
+        plsx["setup_quality"] * 0.46 +
+        plsx["whale_pressure"] * 0.18 +
+        clamp(plsx["ratio_h1"], 0, 3) * 1.10 +
         clamp(plsx["activity_score"], 0, 10) * 0.15 +
-        clamp(plsx["big_transfer_score"], 0, 6) * 0.22 +
+        clamp(plsx["big_transfer_score"], 0, 6) * 0.20 +
         max(plsx["liq_delta_pct"], 0) * 0.04 +
-        clamp(safe_float((plsx.get("sentiment") or {}).get("sentiment_score"), 0.0), -3.0, 3.0) * 0.18
+        clamp(safe_float((plsx.get("sentiment") or {}).get("sentiment_score"), 0.0), -3.0, 3.0) * 0.16
     )
 
     diff = plsx_strength - pls_strength
 
-    if diff >= 2.2 and plsx["ratio_h1"] >= 1.12:
+    if diff >= 2.2 and plsx["ratio_h1"] >= 1.10:
+        strength = "High" if diff >= 3.2 else "Medium"
         return {
             "state": "to_plsx",
-            "title": "🟣 Rotation Alert",
-            "desc": "- 🧠 في انتقال سيولة نحو بولس اكس\n- ⚡ بولس اكس عم تبين أقوى من بولس\n\n👉 **Take Action:** راقب بولس اكس أكثر",
+            "title": "🔄 Rotation Shift",
+            "sections": [
+                "**Flow:** PLS → PLSX",
+                f"**Strength:** {strength}",
+                "",
+                "• Relative strength is leaning toward PLSX",
+                "• Capital flow appears to be favoring PLSX",
+                "",
+                "**Action:** Keep PLSX on closer watch than PLS.",
+            ],
             "color": BLUE,
         }
 
-    if diff <= -2.2 and pls["ratio_h1"] >= 1.12:
+    if diff <= -2.2 and pls["ratio_h1"] >= 1.10:
+        strength = "High" if abs(diff) >= 3.2 else "Medium"
         return {
             "state": "to_pls",
-            "title": "🟢 Rotation Alert",
-            "desc": "- 🧠 في انتقال سيولة نحو بولس\n- ⚡ بولس عم تبين أقوى من بولس اكس\n\n👉 **Take Action:** راقب بولس أكثر",
+            "title": "🔄 Rotation Shift",
+            "sections": [
+                "**Flow:** PLSX → PLS",
+                f"**Strength:** {strength}",
+                "",
+                "• Relative strength is leaning toward PLS",
+                "• Capital flow appears to be favoring PLS",
+                "",
+                "**Action:** Keep PLS on closer watch than PLSX.",
+            ],
             "color": BLUE,
         }
 
@@ -1307,13 +1394,18 @@ def monitor_rotation():
     if state == last_rotation_state and not cooldown_ok:
         return
 
-    send_embed(rotation["title"], rotation["desc"], rotation["color"])
+    embed = format_public_embed(
+        title=rotation["title"],
+        sections=rotation["sections"],
+        color=rotation["color"],
+    )
+    send_embed_obj(embed)
     last_rotation_state = state
     last_rotation_alert_time = time.time()
 
 
 # =========================================================
-# MACRO ALERTS
+# MACRO
 # =========================================================
 def monitor_macro():
     global last_macro_signal, last_macro_alert_time
@@ -1326,24 +1418,41 @@ def monitor_macro():
         return
 
     if bias == "bullish":
-        send_embed(
-            "🟢 ₿ Bitcoin / ⟠ Ethereum",
-            "- 🧠 السوق العام إيجابي\n- 🌤️ هذا الشي ممكن يساعد الألتات\n\n👉 **Take Action:** راقب الزخم — لا تطارد",
-            GREEN,
+        embed = format_public_embed(
+            title="🌍 Macro Environment",
+            sections=[
+                "**Bias:** Supportive",
+                "**Confidence:** Medium",
+                "",
+                "• Bitcoin and Ethereum are supporting overall risk appetite",
+                "• This can help strong alt setups continue",
+                "",
+                "**Action:** Favor quality setups, but avoid chasing.",
+            ],
+            color=GREEN,
         )
     else:
-        send_embed(
-            "🔴 ₿ Bitcoin / ⟠ Ethereum",
-            "- 🧠 السوق العام تحت ضغط\n- ⚠️ هذا الشي يضغط على الألتات\n\n👉 **Take Action:** خفف الاندفاع — انتبه",
-            RED,
+        embed = format_public_embed(
+            title="🌍 Macro Environment",
+            sections=[
+                "**Bias:** Cautious",
+                "**Confidence:** Medium",
+                "",
+                "• Bitcoin and Ethereum are under pressure",
+                "• Weak alt setups can fail faster in this backdrop",
+                "",
+                "**Action:** Reduce aggression and wait for cleaner confirmation.",
+            ],
+            color=RED,
         )
 
+    send_embed_obj(embed)
     last_macro_signal = bias
     last_macro_alert_time = time.time()
 
 
 # =========================================================
-# MAIN LOOP
+# LOOP
 # =========================================================
 def run_cycle():
     refresh_macro()
@@ -1358,7 +1467,7 @@ def run_cycle():
 
 def run_bot():
     load_state()
-    print("PulseChain Rotation Agent PRO started...", flush=True)
+    print(f"{BOT_NAME} started...", flush=True)
 
     while True:
         try:
